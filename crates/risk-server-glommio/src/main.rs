@@ -12,21 +12,13 @@ use risk_core::{
     config::Config, pipeline::AppCore, schema::ScoreRequest, util::now_us, xgb_pool::XgbPoolError,
 };
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::path::Path;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-mod mamba_runtime;
-use mamba_runtime::{
-    mlockall, CircuitBreakerConfig, FallbackMode, HugepagePolicy, MambaRuntime, MemoryPolicy,
-};
 
 static TRACE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 const L2_EXTRA_MAX: usize = 32;
@@ -37,56 +29,6 @@ struct AppState {
     prom: PrometheusHandle,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: usize,
-    mamba: Option<Arc<MambaRuntime>>,
-    mamba_policy_hash: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MambaRequest {
-    input_ids: Vec<i64>,
-    #[serde(default, rename = "static")]
-    static_feat: Vec<f32>,
-    #[serde(default)]
-    static_total: Vec<f32>,
-    trace_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct MambaTimingsUs {
-    parse: u64,
-    queue: u64,
-    assemble: u64,
-    kernel: u64,
-    post: u64,
-    serialize: u64,
-    other: u64,
-}
-
-impl Default for MambaTimingsUs {
-    fn default() -> Self {
-        Self {
-            parse: 0,
-            queue: 0,
-            assemble: 0,
-            kernel: 0,
-            post: 0,
-            serialize: 0,
-            other: 0,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct MambaResponse {
-    trace_id: String,
-    margin: f32,
-    logits: [f32; 2],
-    dispatch: String,
-    math_backend: String,
-    schema_hash: String,
-    policy_hash: String,
-    fallback: Option<String>,
-    timings_us: MambaTimingsUs,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -111,70 +53,6 @@ struct Args {
     /// 启动后预热次数（仅当启用 --model-dir 时生效；0=不预热）
     #[arg(long, default_value_t = 100)]
     warmup_iters: usize,
-
-    /// 可选：启用 Mamba stateless 推理（bundle 目录）
-    #[arg(long)]
-    mamba_bundle_dir: Option<String>,
-
-    /// Mamba dispatch: auto|scalar|avx2|avx512
-    #[arg(long, default_value = "auto")]
-    mamba_dispatch: String,
-
-    /// Mamba math backend: fast|fast_wild|exact
-    #[arg(long, default_value = "fast")]
-    mamba_math: String,
-
-    /// Mamba scratch pool size (per-process)
-    #[arg(long, default_value_t = 2)]
-    mamba_scratch_pool: usize,
-
-    /// Mamba auto-dispatch microbench iters
-    #[arg(long, default_value_t = 20)]
-    mamba_auto_iters: usize,
-
-    /// Mamba auto-dispatch warmup iters
-    #[arg(long, default_value_t = 5)]
-    mamba_auto_warmup: usize,
-
-    /// Circuit breaker max consecutive errors
-    #[arg(long, default_value_t = 5)]
-    mamba_cb_max_errors: u64,
-
-    /// Circuit breaker error rate threshold (0..1)
-    #[arg(long, default_value_t = 0.05)]
-    mamba_cb_error_rate: f64,
-
-    /// Circuit breaker window (ms)
-    #[arg(long, default_value_t = 1000)]
-    mamba_cb_window_ms: u64,
-
-    /// Circuit breaker trip duration (ms)
-    #[arg(long, default_value_t = 5000)]
-    mamba_cb_trip_ms: u64,
-
-    /// Fallback strategy: exact|zero
-    #[arg(long, default_value = "exact", value_parser = ["exact", "zero"])]
-    mamba_fallback: String,
-
-    /// Enable mlockall(MCL_CURRENT|MCL_FUTURE) for the process
-    #[arg(long, default_value_t = false)]
-    mamba_mlock: bool,
-
-    /// Fail startup if mlockall fails
-    #[arg(long, default_value_t = false)]
-    mamba_mlock_required: bool,
-
-    /// Pretouch weights + scratch to reduce page faults
-    #[arg(long, default_value_t = false)]
-    mamba_pretouch: bool,
-
-    /// madvise hugepage policy: never|madvise
-    #[arg(long, default_value = "never", value_parser = ["never", "madvise"])]
-    mamba_hugepage: String,
-
-    /// madvise(MADV_WILLNEED) on weights + scratch
-    #[arg(long, default_value_t = false)]
-    mamba_willneed: bool,
 }
 fn main() -> anyhow::Result<()> {
     // tracing
@@ -227,82 +105,11 @@ fn main() -> anyhow::Result<()> {
         Arc::new(AppCore::new(cfg))
     };
 
-    let mamba_policy_hash = read_policy_hash().unwrap_or_else(|e| {
-        tracing::warn!("mamba policy hash unavailable: {}", e);
-        "none".to_string()
-    });
-
-    let mamba = if let Some(dir) = args.mamba_bundle_dir.as_deref() {
-        tracing::info!(
-            "mamba enabled, bundle_dir={} dispatch={} math={}",
-            dir,
-            args.mamba_dispatch,
-            args.mamba_math
-        );
-        if args.mamba_mlock {
-            match mlockall() {
-                Ok(()) => tracing::info!("mamba mlockall enabled"),
-                Err(e) => {
-                    if args.mamba_mlock_required {
-                        return Err(anyhow::anyhow!(e));
-                    }
-                    tracing::warn!("mlockall failed: {}", e);
-                }
-            }
-        }
-        let hugepage = match args.mamba_hugepage.as_str() {
-            "madvise" => HugepagePolicy::Madvise,
-            _ => HugepagePolicy::Never,
-        };
-        let mem_policy = MemoryPolicy {
-            pretouch: args.mamba_pretouch,
-            hugepage,
-            willneed: args.mamba_willneed,
-        };
-        let cb_cfg = CircuitBreakerConfig {
-            max_errors: args.mamba_cb_max_errors,
-            error_rate: args.mamba_cb_error_rate,
-            window_ms: args.mamba_cb_window_ms,
-            trip_ms: args.mamba_cb_trip_ms,
-        };
-        let fallback = match args.mamba_fallback.as_str() {
-            "exact" => FallbackMode::Exact,
-            "zero" => FallbackMode::DefaultZero,
-            _ => FallbackMode::Exact,
-        };
-        let runtime = MambaRuntime::load(
-            Path::new(dir),
-            &args.mamba_dispatch,
-            &args.mamba_math,
-            args.mamba_scratch_pool,
-            args.mamba_auto_iters,
-            args.mamba_auto_warmup,
-            mem_policy,
-            cb_cfg,
-            fallback,
-        )
-        .map_err(|e| anyhow::anyhow!(e))?;
-        tracing::info!(
-            "mamba ready: schema_hash={} dispatch={} math={} kernel_path={} layout={} mlp_impl={}",
-            runtime.schema_hash(),
-            runtime.dispatch_label(),
-            runtime.math_label(),
-            runtime.kernel_path_label(),
-            runtime.layout_label(),
-            runtime.mlp_impl_label()
-        );
-        Some(Arc::new(runtime))
-    } else {
-        None
-    };
-
     let state = AppState {
         core,
         prom,
         in_flight: Arc::new(AtomicUsize::new(0)),
         max_in_flight: args.max_in_flight,
-        mamba,
-        mamba_policy_hash,
     };
 
     // ====== Startup: print L1/L2 backend + policy thresholds + schema hash ======
@@ -343,10 +150,6 @@ fn main() -> anyhow::Result<()> {
         tracing::info!("warmup_xgb start iters={}", args.warmup_iters);
         state.core.warmup_xgb(args.warmup_iters)?;
         tracing::info!("warmup_xgb done cost={}ms", t.elapsed().as_millis());
-    }
-
-    if let Ok(cpus) = get_self_affinity_cpus() {
-        tracing::info!("process affinity cpus={:?}", cpus);
     }
 
     // ✅ thread-per-core：优先在“当前进程允许的 CPU 集合”里，扣掉 XGB pool pin 过的 CPU，剩下的给 Glommio IO executors。
@@ -582,149 +385,6 @@ async fn handle_conn(
         } else if meta.method == "POST" && meta.path == "/score" {
             let req: ScoreRequest = serde_json::from_slice(body.as_ref())?;
             let resp = st.core.score(req);
-            let body = serde_json::to_vec(&resp)?;
-            write_http(
-                &mut stream,
-                &mut out,
-                200,
-                "application/json",
-                &body,
-                keep_alive,
-            )
-            .await?;
-        } else if meta.method == "POST" && meta.path == "/score_mamba" {
-            let t0 = std::time::Instant::now();
-            let t_parse = std::time::Instant::now();
-
-            let req: MambaRequest = match serde_json::from_slice(body.as_ref()) {
-                Ok(v) => v,
-                Err(e) => {
-                    let msg = format!("invalid json body: {}", e);
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        400,
-                        "text/plain",
-                        msg.as_bytes(),
-                        keep_alive,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-            let mut timings = MambaTimingsUs::default();
-            timings.parse = now_us(t_parse);
-
-            let mamba = match st.mamba.as_ref() {
-                Some(m) => m.clone(),
-                None => {
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        503,
-                        "text/plain",
-                        b"mamba not enabled",
-                        keep_alive,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-
-            let t_queue = std::time::Instant::now();
-            let (_g, _p) = match try_acquire_inflight(&st, core_sem.as_ref()) {
-                Some(g) => g,
-                None => {
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        429,
-                        "text/plain",
-                        b"overloaded",
-                        keep_alive,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-            timings.queue = now_us(t_queue);
-
-            let t_assemble = std::time::Instant::now();
-            let static_total = if !req.static_total.is_empty() {
-                req.static_total
-            } else {
-                req.static_feat
-            };
-            if req.input_ids.len() != mamba.input_ids_len()
-                || static_total.len() != mamba.static_dim_total()
-            {
-                let msg = format!(
-                    "input shape mismatch: input_ids={} static_total={}",
-                    req.input_ids.len(),
-                    static_total.len()
-                );
-                write_http(
-                    &mut stream,
-                    &mut out,
-                    400,
-                    "text/plain",
-                    msg.as_bytes(),
-                    keep_alive,
-                )
-                .await?;
-                continue;
-            }
-            timings.assemble = now_us(t_assemble);
-
-            let t_kernel = std::time::Instant::now();
-            let mamba_out = match mamba.score(&req.input_ids, &static_total) {
-                Ok(v) => v,
-                Err(e) => {
-                    let msg = format!("mamba error: {}", e);
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        500,
-                        "text/plain",
-                        msg.as_bytes(),
-                        keep_alive,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-            timings.kernel = now_us(t_kernel);
-
-            let t_post = std::time::Instant::now();
-            let trace_id = req
-                .trace_id
-                .unwrap_or_else(|| TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed).to_string());
-            let mut resp = MambaResponse {
-                trace_id,
-                margin: mamba_out.margin,
-                logits: mamba_out.logits,
-                dispatch: mamba_out.dispatch,
-                math_backend: mamba_out.math,
-                schema_hash: mamba.schema_hash().to_string(),
-                policy_hash: st.mamba_policy_hash.clone(),
-                fallback: mamba_out.fallback_reason,
-                timings_us: MambaTimingsUs::default(),
-            };
-            timings.post = now_us(t_post);
-
-            let t_ser = std::time::Instant::now();
-            let _body = serde_json::to_vec(&resp)?;
-            timings.serialize = now_us(t_ser);
-
-            let total_us = now_us(t0);
-            let known = timings.parse
-                + timings.assemble
-                + timings.kernel
-                + timings.post
-                + timings.serialize;
-            timings.other = total_us.saturating_sub(known);
-            resp.timings_us = timings;
-
             let body = serde_json::to_vec(&resp)?;
             write_http(
                 &mut stream,
@@ -1329,14 +989,6 @@ fn get_self_affinity_cpus() -> anyhow::Result<Vec<usize>> {
             .unwrap_or(1);
         Ok((0..n).collect())
     }
-}
-
-fn read_policy_hash() -> anyhow::Result<String> {
-    let path = std::env::var("MAMBA_POLICY_PATH").unwrap_or_else(|_| "gate_policy_v1_mainline.json".to_string());
-    let data = std::fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn map_xgb_error(e: &anyhow::Error) -> (u16, String) {

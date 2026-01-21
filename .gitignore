@@ -37,12 +37,3 @@ target/
 *.patch*
 crates/risk-core/native/
 .cache/*
-
-# Track only crates/*; ignore other untracked top-level items.
-/*
-!/crates/
-!/crates/**
-!.gitignore
-/crates/results/
-/crates/risk-bench-lag-delay.patch
-/crates/risk-core/native/

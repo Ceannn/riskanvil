@@ -1,0 +1,29 @@
+[package]
+name = "risk_mamba_runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.20", features = ["derive"] }
+libc = "0.2"
+ndarray = "0.15"
+ndarray-npy = "0.8"
+onnxruntime-sys = { version = "0.0.14", features = ["disable-sys-build-script"] }
+num_cpus = "1.16"
+rand = "0.8"
+risk-mamba-kernel = { path = "../risk-mamba-kernel" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1"
+sha2 = "0.10"
+zip = "0.6"
+libm = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[features]
+default = ["v1_mainline"]
+v1_mainline = []
+v1_1_experiment = []
+stage_timing = ["risk-mamba-kernel/stage_timing"]
+bench_instrument = ["risk-mamba-kernel/bench_instrument"]
+sleef = ["risk-mamba-kernel/sleef"]

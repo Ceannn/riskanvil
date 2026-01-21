@@ -5,8 +5,19 @@ members = [
   "crates/risk-server-tokio",
   "crates/risk-bench",
   "crates/risk-bench2",
-  "crates/risk-server-glommio"
-
+  "crates/risk-server-glommio",
+  "crates/risk-mamba-kernel",
+  "crates/risk_mamba_runner",
+  "crates/risk-mamba-v1"
+]
+default-members = [
+  "crates/risk-core",
+  "crates/risk-server-tokio",
+  "crates/risk-bench",
+  "crates/risk-bench2",
+  "crates/risk-server-glommio",
+  "crates/risk-mamba-kernel",
+  "crates/risk_mamba_runner"
 ]
 
 [profile.release]

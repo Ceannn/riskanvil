@@ -1,12 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Instant};
+use std::{net::SocketAddr, path::Path, str::FromStr, sync::Arc, time::Instant};
 
 use anyhow::Context;
 use axum::{
     body::Bytes,
     error_handling::HandleErrorLayer,
     extract::State,
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -15,14 +15,24 @@ use clap::Parser;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use risk_core::{
     config::Config,
+    pipeline::StandaloneL2TauMode,
     pipeline::AppCore,
-    schema::{Decision, ScoreRequest, ScoreResponse},
-    xgb_pool::XgbPoolError,
+    quickscorer::QuickRouteMeta,
+    schema::{Decision, ScoreResponse},
 };
+use risk_quickscorer_standalone_l2::StandaloneL2Runtime;
 use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+const HDR_RISK_TIMINGS_US: HeaderName = HeaderName::from_static("x-risk-timings-us");
+
+#[derive(Clone, Debug)]
+struct DenseRequest {
+    payload: Bytes,
+    route_meta: Option<QuickRouteMeta>,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "risk-server-tokio", version, about)]
@@ -31,23 +41,37 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: String,
 
-    /// L1 model directory (required)
+    /// QuickScorer bundle root (required)
     #[arg(long, value_name = "DIR")]
-    model_dir: String,
-
-    /// L2 model directory (optional). If provided, enables L1/L2 cascade inside risk-core.
-    #[arg(long = "model-l2-dir", value_name = "DIR")]
-    model_l2_dir: Option<String>,
+    bundle_dir: String,
 
     /// Max in-flight HTTP requests (tower concurrency_limit)
     #[arg(long, default_value_t = 4096)]
     max_in_flight: usize,
+
+    /// Benchmark-only synthetic L2 mode: standalone-sidecar
+    #[arg(long, value_parser = ["standalone-sidecar"])]
+    l2_bench_mode: Option<String>,
+
+    /// Optional override for standalone L2 89-dim feat_bin
+    #[arg(long)]
+    l2_bench_feat_bin: Option<String>,
+
+    /// Tau source for benchmark-only standalone L2: request|fixed
+    #[arg(long, value_parser = ["request", "fixed"], default_value = "request")]
+    l2_bench_tau_mode: String,
+
+    /// Fixed tau used when --l2-bench-tau-mode=fixed
+    #[arg(long)]
+    l2_bench_fixed_tau: Option<f32>,
 }
 
 #[derive(Clone)]
 struct AppState {
     core: Arc<AppCore>,
     prom: PrometheusHandle,
+    standalone_l2_bench: Option<Arc<StandaloneL2Runtime>>,
+    standalone_l2_tau_mode: Option<StandaloneL2TauMode>,
 }
 
 static TRACE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -72,23 +96,6 @@ fn install_prometheus() -> PrometheusHandle {
         .expect("install prometheus recorder")
 }
 
-/// Parse JSON body into a JSON object map.
-/// Accepts either:
-///  1) {"features": {...}, ...}  -> use the "features" object
-///  2) {...}                    -> use the root object
-fn json_obj_from_body(body: &Bytes) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
-    let v: serde_json::Value = serde_json::from_slice(body).context("invalid json")?;
-
-    if let Some(features) = v.get("features").and_then(|x| x.as_object()) {
-        return Ok(features.clone());
-    }
-    if let Some(obj) = v.as_object() {
-        return Ok(obj.clone());
-    }
-
-    anyhow::bail!("json must be an object (or contain an object field `features`)")
-}
-
 async fn health() -> &'static str {
     "ok"
 }
@@ -98,35 +105,11 @@ async fn metrics(State(st): State<AppState>) -> String {
 }
 
 async fn debug_backend(State(st): State<AppState>) -> Response {
-    let l1 = st.core.xgb.as_ref();
-    let l2 = st.core.xgb_l2.as_ref();
-    let aug = st.core.stateful_l2.as_ref();
+    let quick = st.core.quick.as_ref();
     let l2_ctrl = st.core.l2_ctrl();
 
     let body = serde_json::json!({
-        "l1": l1.map(|m| serde_json::json!({
-            "backend": m.backend_name(),
-            "model_dir": m.model_dir.to_string_lossy(),
-            "feature_dim": m.feature_names.len(),
-            "schema_hash": m.schema_hash_hex(),
-            "thresholds": {
-                "review": m.policy.review_threshold,
-                "deny": m.policy.deny_threshold,
-            },
-        })),
-        "l2": l2.map(|m| serde_json::json!({
-            "backend": m.backend_name(),
-            "model_dir": m.model_dir.to_string_lossy(),
-            "feature_dim": m.feature_names.len(),
-            "schema_hash": m.schema_hash_hex(),
-            "thresholds": {
-                "review": m.policy.review_threshold,
-                "deny": m.policy.deny_threshold,
-            },
-        })),
-        "stateful_l2": aug.map(|_| serde_json::json!({
-            "enabled": true,
-        })).unwrap_or(serde_json::json!({"enabled": false})),
+        "quickscorer": quick.map(|q| q.debug_info()),
         "router_l2": {
             "sample_ratio": l2_ctrl.sample_ratio(),
             "sample_base_ratio": l2_ctrl.sample_base_ratio(),
@@ -135,144 +118,27 @@ async fn debug_backend(State(st): State<AppState>) -> Response {
             "waterline_hi": l2_ctrl.sample_waterline_hi(),
             "waterline_lo": l2_ctrl.sample_waterline_lo(),
         },
+        "benchmark_l2": st.standalone_l2_bench.as_ref().map(|rt: &Arc<StandaloneL2Runtime>| serde_json::json!({
+            "enabled": true,
+            "feat_rows": rt.feat_rows(),
+            "l2_dim": rt.l2_dim(),
+            "tau_mode": match st.standalone_l2_tau_mode {
+                Some(StandaloneL2TauMode::Request) => "request",
+                Some(StandaloneL2TauMode::Fixed(_)) => "fixed",
+                None => "none",
+            }
+        })).unwrap_or_else(|| serde_json::json!({
+            "enabled": false
+        })),
     });
 
     (StatusCode::OK, Json(body)).into_response()
 }
 
-/// Full pipeline endpoint (if you still want it).
-/// NOTE: risk-core 的 score() 在你项目里是同步的，所以这里不 await。
-async fn score(State(st): State<AppState>, Json(req): Json<ScoreRequest>) -> Json<ScoreResponse> {
-    Json(st.core.score(req))
-}
-
-/// Baseline: single-model, but still CPU-bound; we push it into spawn_blocking.
-async fn score_xgb(State(st): State<AppState>, body: Bytes) -> Response {
-    let t0 = Instant::now();
-    let obj = match json_obj_from_body(&body) {
-        Ok(obj) => obj,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    };
-    let parse_us = t0.elapsed().as_micros() as u64;
-
-    let core = st.core.clone();
-    let res = tokio::task::spawn_blocking(move || core.score_xgb(parse_us, &obj))
-        .await
-        .map_err(|e| anyhow::anyhow!(e))
-        .and_then(|x| x);
-
-    match res {
-        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(e) => {
-            error!(error = %e, "score_xgb failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
-    }
-}
-
-/// Main endpoint: XGB pool (and cascade inside risk-core if enabled).
-/// We parse JSON here to get obj reference, then call score_xgb_pool_async(parse_us, obj).
-async fn score_xgb_pool(State(st): State<AppState>, body: Bytes) -> Response {
-    let t0 = Instant::now();
-    let v: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid json: {e}")).into_response(),
-    };
-    let parse_us = t0.elapsed().as_micros() as u64;
-
-    // Borrow the object map across the await (v lives for the whole function).
-    let obj = if let Some(features) = v.get("features").and_then(|x| x.as_object()) {
-        features
-    } else if let Some(obj) = v.as_object() {
-        obj
-    } else {
-        return (StatusCode::BAD_REQUEST, "json must be an object").into_response();
-    };
-
-    let res = st.core.score_xgb_pool_async(parse_us, obj).await;
-
-    match res {
-        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(e) => {
-            // ✅ 把“可预期的背压”映射为 429
-            if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
-                match pe {
-                    XgbPoolError::QueueFull => {
-                        return (StatusCode::TOO_MANY_REQUESTS, "QueueFull").into_response()
-                    }
-                    XgbPoolError::DeadlineExceeded => {
-                        return (StatusCode::TOO_MANY_REQUESTS, "DeadlineExceeded").into_response()
-                    }
-                    XgbPoolError::WorkerDown => {
-                        // worker 掉了属于服务不可用（和背压不一样）
-                        return (StatusCode::SERVICE_UNAVAILABLE, "WorkerDown").into_response();
-                    }
-                    // 兼容未来 enum 扩展（不炸 match）
-                    _ => {}
-                }
-            }
-
-            error!(error = %e, "score_xgb_pool failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
-    }
-}
-
 /// tower 的 load_shed / concurrency_limit 早拒绝会走到这里。
 /// 我们统一变成 429 overloaded（不再出现你日志里的 503 latency=0ms）。
 
-/// ✅ Dense f32 直传：Content-Type: application/octet-stream
-/// Body 格式：
-/// - 推荐（无 header）：连续 dim 个 f32（little-endian），总长度 = dim*4
-/// - 可选（带 header）：
-///   magic="RVEC"(4) + ver(u16=1) + flags(u16=0) + dim(u32) + reserved(u32) + payload(f32*dim)
-async fn score_dense_f32(State(st): State<AppState>, body: Bytes) -> Response {
-    let t0 = Instant::now();
-
-    let Some(xgb1) = st.core.xgb.as_ref() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "xgb not enabled: start server with --model-dir",
-        )
-            .into_response();
-    };
-    let expected_dim = xgb1.feature_names.len();
-
-    let payload = match parse_dense_payload_le(&body, expected_dim) {
-        Ok(v) => v,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
-    };
-
-    let parse_us = t0.elapsed().as_micros() as u64;
-    let res = st
-        .core
-        .score_xgb_pool_dense_bytes_async(parse_us, payload)
-        .await;
-
-    match res {
-        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(e) => {
-            if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
-                match pe {
-                    XgbPoolError::QueueFull => {
-                        return (StatusCode::TOO_MANY_REQUESTS, "QueueFull").into_response()
-                    }
-                    XgbPoolError::DeadlineExceeded => {
-                        return (StatusCode::TOO_MANY_REQUESTS, "DeadlineExceeded").into_response()
-                    }
-                    XgbPoolError::WorkerDown => {
-                        return (StatusCode::SERVICE_UNAVAILABLE, "WorkerDown").into_response();
-                    }
-                    _ => {}
-                }
-            }
-            error!(error = %e, "score_dense_f32 failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
-    }
-}
-
-fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<Bytes, String> {
+fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<DenseRequest, String> {
     let b = body.as_ref();
 
     // Fast path: raw payload (no header)
@@ -280,7 +146,10 @@ fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<Bytes, St
         .checked_mul(4)
         .ok_or_else(|| "expected_dim too large".to_string())?;
     if b.len() == raw_len {
-        return Ok(body.clone());
+        return Ok(DenseRequest {
+            payload: body.clone(),
+            route_meta: None,
+        });
     }
 
     // Headered payload
@@ -291,9 +160,6 @@ fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<Bytes, St
         return Err("invalid dense payload (missing magic RVEC)".into());
     }
     let ver = u16::from_le_bytes([b[4], b[5]]);
-    if ver != 1 {
-        return Err(format!("unsupported RVEC version: {}", ver));
-    }
     let flags = u16::from_le_bytes([b[6], b[7]]);
     if flags != 0 {
         return Err(format!("unsupported RVEC flags: {}", flags));
@@ -305,17 +171,74 @@ fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<Bytes, St
             dim, expected_dim
         ));
     }
-    let need = 16 + raw_len;
-    if b.len() != need {
-        return Err(format!(
-            "invalid payload size: got {}, expected {}",
-            b.len(),
-            need
-        ));
+    match ver {
+        1 => {
+            let need = 16 + raw_len;
+            if b.len() != need {
+                return Err(format!(
+                    "invalid payload size: got {}, expected {}",
+                    b.len(),
+                    need
+                ));
+            }
+            Ok(DenseRequest {
+                payload: body.slice(16..),
+                route_meta: None,
+            })
+        }
+        2 => {
+            let need = 32 + raw_len;
+            if b.len() != need {
+                return Err(format!(
+                    "invalid payload size: got {}, expected {}",
+                    b.len(),
+                    need
+                ));
+            }
+            let fold_id = i32::from_le_bytes([b[12], b[13], b[14], b[15]]);
+            let seg_prod_amtbin = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
+            let transaction_id =
+                u64::from_le_bytes([b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]]);
+            let row_idx = u32::from_le_bytes([b[28], b[29], b[30], b[31]]);
+            Ok(DenseRequest {
+                payload: body.slice(32..),
+                route_meta: Some(QuickRouteMeta {
+                    row_idx,
+                    transaction_id,
+                    fold_id,
+                    seg_prod_amtbin,
+                    l2_tau_used: None,
+                }),
+            })
+        }
+        3 => {
+            let need = 40 + raw_len;
+            if b.len() != need {
+                return Err(format!(
+                    "invalid payload size: got {}, expected {}",
+                    b.len(),
+                    need
+                ));
+            }
+            let fold_id = i32::from_le_bytes([b[12], b[13], b[14], b[15]]);
+            let seg_prod_amtbin = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
+            let transaction_id =
+                u64::from_le_bytes([b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]]);
+            let row_idx = u32::from_le_bytes([b[28], b[29], b[30], b[31]]);
+            let l2_tau_used = f32::from_le_bytes([b[32], b[33], b[34], b[35]]);
+            Ok(DenseRequest {
+                payload: body.slice(40..),
+                route_meta: Some(QuickRouteMeta {
+                    row_idx,
+                    transaction_id,
+                    fold_id,
+                    seg_prod_amtbin,
+                    l2_tau_used: Some(l2_tau_used),
+                }),
+            })
+        }
+        _ => Err(format!("unsupported RVEC version: {}", ver)),
     }
-
-    // Zero-copy slice (refcounted)
-    Ok(body.slice(16..))
 }
 
 fn decision_to_u8(d: &Decision) -> u8 {
@@ -335,7 +258,7 @@ fn decision_to_u8(d: &Decision) -> u8 {
 /// - score(f32)
 /// - decision(u8)
 /// - pad[3]
-/// - timings_us[6](u32): parse/feature/router/xgb/l2/serialize
+/// - timings_us[6](u32): parse/feature/router/l1/l2/serialize
 fn encode_rsk1_response(trace_id: u64, resp: &ScoreResponse) -> Vec<u8> {
     let mut out = Vec::with_capacity(48);
     out.extend_from_slice(b"RSK1");
@@ -365,7 +288,7 @@ fn encode_rsk1_response(trace_id: u64, resp: &ScoreResponse) -> Vec<u8> {
     }
 
     let ts = &resp.timings_us;
-    for v in [ts.parse, ts.feature, ts.router, ts.xgb, ts.l2, ts.serialize] {
+    for v in [ts.parse, ts.feature, ts.router, ts.l1, ts.l2, ts.serialize] {
         out.extend_from_slice(&clamp_u32(v).to_le_bytes());
     }
 
@@ -377,21 +300,51 @@ fn encode_rsk1_response(trace_id: u64, resp: &ScoreResponse) -> Vec<u8> {
     out
 }
 
+/// QSB2 binary response layout (24 bytes, little-endian):
+/// - magic[4] = "QSB2"
+/// - version(u16)=1
+/// - decision(u8)
+/// - flags(u8): bit0=l2_path
+/// - trace_id(u64)
+/// - score(f32)
+/// - reserved(u32)=0
+fn encode_qsb2_response(trace_id: u64, resp: &ScoreResponse) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    out.extend_from_slice(b"QSB2");
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.push(decision_to_u8(&resp.decision));
+    let flags = if resp.timings_us.l2 > 0 { 1u8 } else { 0u8 };
+    out.push(flags);
+    out.extend_from_slice(&trace_id.to_le_bytes());
+    out.extend_from_slice(&(resp.score as f32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    debug_assert!(out.len() == 24, "QSB2 response must be 24 bytes");
+    out
+}
+
+fn encode_timings_header_value(resp: &ScoreResponse) -> Option<HeaderValue> {
+    let ts = &resp.timings_us;
+    HeaderValue::from_str(&format!(
+        "{},{},{},{},{},{}",
+        ts.parse, ts.feature, ts.router, ts.l1, ts.l2, ts.serialize
+    ))
+    .ok()
+}
+
 /// ✅ Dense f32 直传 + Binary response（application/octet-stream）
-/// 请求体同 /score_dense_f32（raw 或 RVEC header）。
+/// 请求体为 raw f32le 或带 RVEC header 的 dense payload。
 async fn score_dense_f32_bin(State(st): State<AppState>, body: Bytes) -> Response {
     let t0 = Instant::now();
 
-    let Some(xgb1) = st.core.xgb.as_ref() else {
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "xgb not enabled: start server with --model-dir",
+            "quickscorer not enabled: start server with --bundle-dir",
         )
             .into_response();
     };
-    let expected_dim = xgb1.feature_names.len();
 
-    let payload = match parse_dense_payload_le(&body, expected_dim) {
+    let req = match parse_dense_payload_le(&body, expected_dim) {
         Ok(v) => v,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
@@ -399,10 +352,30 @@ async fn score_dense_f32_bin(State(st): State<AppState>, body: Bytes) -> Respons
     let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
     let parse_us = t0.elapsed().as_micros() as u64;
 
-    let res = st
-        .core
-        .score_xgb_pool_dense_bytes_async(parse_us, payload)
-        .await;
+    let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let res = if let (Some(rt), Some(tau_mode)) =
+        (st.standalone_l2_bench.as_ref(), st.standalone_l2_tau_mode)
+    {
+        let sidecar_row_idx = req
+            .route_meta
+            .as_ref()
+            .map(|m| m.row_idx as usize)
+            .unwrap_or(trace_id as usize);
+        st.core
+            .score_quick_dense_bytes_with_standalone_bench_l2_async(
+                parse_us,
+                req.payload,
+                req.route_meta,
+                rt,
+                sidecar_row_idx,
+                tau_mode,
+            )
+            .await
+    } else {
+        st.core
+            .score_quick_dense_bytes_with_meta_async(parse_us, req.payload, req.route_meta)
+            .await
+    };
 
     match res {
         Ok(resp) => {
@@ -424,22 +397,71 @@ async fn score_dense_f32_bin(State(st): State<AppState>, body: Bytes) -> Respons
             r
         }
         Err(e) => {
-            if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
-                match pe {
-                    XgbPoolError::QueueFull => {
-                        return (StatusCode::TOO_MANY_REQUESTS, "QueueFull").into_response()
-                    }
-                    XgbPoolError::DeadlineExceeded => {
-                        return (StatusCode::TOO_MANY_REQUESTS, "DeadlineExceeded").into_response()
-                    }
-                    XgbPoolError::WorkerDown => {
-                        return (StatusCode::SERVICE_UNAVAILABLE, "WorkerDown").into_response();
-                    }
-                    _ => {}
-                }
-            }
-
             error!(error = %e, trace_id = trace_id, "score_dense_f32_bin failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+async fn score_dense_f32_bin_v2(State(st): State<AppState>, body: Bytes) -> Response {
+    let t0 = Instant::now();
+
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quickscorer not enabled: start server with --bundle-dir",
+        )
+            .into_response();
+    };
+
+    let req = match parse_dense_payload_le(&body, expected_dim) {
+        Ok(v) => v,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+
+    let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let parse_us = t0.elapsed().as_micros() as u64;
+
+    let res = if let (Some(rt), Some(tau_mode)) =
+        (st.standalone_l2_bench.as_ref(), st.standalone_l2_tau_mode)
+    {
+        let sidecar_row_idx = req
+            .route_meta
+            .as_ref()
+            .map(|m| m.row_idx as usize)
+            .unwrap_or(trace_id as usize);
+        st.core
+            .score_quick_dense_bytes_with_standalone_bench_l2_async(
+                parse_us,
+                req.payload,
+                req.route_meta,
+                rt,
+                sidecar_row_idx,
+                tau_mode,
+            )
+            .await
+    } else {
+        st.core
+            .score_quick_dense_bytes_with_meta_async(parse_us, req.payload, req.route_meta)
+            .await
+    };
+
+    match res {
+        Ok(resp) => {
+            let bin = encode_qsb2_response(trace_id, &resp);
+            let mut r = Response::new(axum::body::Body::from(bin));
+            *r.status_mut() = StatusCode::OK;
+            r.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            if let Some(v) = encode_timings_header_value(&resp) {
+                r.headers_mut().insert(HDR_RISK_TIMINGS_US, v);
+            }
+            r
+        }
+        Err(e) => {
+            error!(error = %e, trace_id = trace_id, "score_dense_f32_bin_v2 failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
@@ -470,42 +492,63 @@ async fn async_main(
         }
     }
 
-    let core = AppCore::new_with_xgb_l1_l2(cfg, &args.model_dir, args.model_l2_dir.as_deref())
-        .context("init AppCore")?;
-    if let Some(xgb1) = core.xgb.as_ref() {
-        if xgb1.backend_name() == "xgb_ffi" {
-            warn!("xgb_ffi backend is deprecated; use native_tl2cgen");
-        }
-    }
-    if let Some(xgb2) = core.xgb_l2.as_ref() {
-        if xgb2.backend_name() == "xgb_ffi" {
-            warn!("xgb_ffi backend is deprecated; use native_tl2cgen");
-        }
-    }
+    let core = AppCore::new_with_quickscorer_bundle(cfg, &args.bundle_dir)
+        .context("init AppCore(bundle)")?;
 
-    if let Some(dir2) = args.model_l2_dir.as_deref() {
+    let standalone_l2_bench = if args.l2_bench_mode.as_deref() == Some("standalone-sidecar") {
+        let runtime = if let Some(path) = args.l2_bench_feat_bin.as_deref() {
+            Arc::new(StandaloneL2Runtime::load_with_feat_bin_override(
+                Path::new(&args.bundle_dir),
+                Some(Path::new(path)),
+            )?)
+        } else {
+            Arc::new(StandaloneL2Runtime::load(Path::new(&args.bundle_dir))?)
+        };
+        Some(runtime)
+    } else {
+        None
+    };
+    let standalone_l2_tau_mode = if standalone_l2_bench.is_some() {
+        Some(match args.l2_bench_tau_mode.as_str() {
+            "fixed" => StandaloneL2TauMode::Fixed(
+                args.l2_bench_fixed_tau
+                    .context("--l2-bench-fixed-tau is required when --l2-bench-tau-mode=fixed")?,
+            ),
+            _ => StandaloneL2TauMode::Request,
+        })
+    } else {
+        None
+    };
+
+    if let Some(q) = core.quick.as_ref() {
+        let dbg = q.debug_info();
         info!(
-            "XGB cascade enabled: l1_dir={} l2_dir={}",
-            args.model_dir, dir2
+            "QuickScorer enabled: backend={} l1_dim={} l2_dim={} l1_thr={} fold={} gb_target={} segmented={}",
+            dbg.backend,
+            dbg.l1_dim,
+            dbg.l2_dim,
+            dbg.l1_threshold,
+            dbg.l2_default_fold,
+            dbg.l2_gb_target,
+            dbg.l2_segmented
         );
     } else {
-        info!("XGB single-model: l1_dir={}", args.model_dir);
+        warn!("QuickScorer not enabled");
     }
 
     let st = AppState {
         core: Arc::new(core),
         prom,
+        standalone_l2_bench,
+        standalone_l2_tau_mode,
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/debug/backend", get(debug_backend))
-        .route("/score", post(score))
-        .route("/score_xgb", post(score_xgb))
-        .route("/score_xgb_pool", post(score_xgb_pool))
-        .route("/score_dense_f32", post(score_dense_f32))
         .route("/score_dense_f32_bin", post(score_dense_f32_bin))
+        .route("/score_dense_f32_bin_v2", post(score_dense_f32_bin_v2))
         .with_state(st)
         .layer(
             ServiceBuilder::new()

@@ -2,45 +2,23 @@
 name = "risk-core"
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-dashmap = "6"
-once_cell = "1"
 metrics = "0.23"
 thiserror = "1"
 anyhow = "1"
 flate2 = "1"
-hashbrown = "0.14"
-ahash = "0.8"
-parking_lot = "0.12"
-#xgboost = { package = "xgboostrs", version = "0.2.0" }
-# NOTE: the crate directory is `crates/xgb-ffi`, but its package name is `xgb_ffi`
-# Use `package = "xgb_ffi"` to avoid Cargo package-name mismatch.
-xgb_ffi = { path = "../xgb-ffi", package = "xgb_ffi", optional = true }
-crossbeam-channel = "0.5"
-futures-channel = "0.3"
-core_affinity = "0.8"
-# risk-core only needs Tokio's sync primitives (mpsc/oneshot). Keep it minimal so
-# it builds cleanly even when the top-level binary is not Tokio-based (e.g. glommio).
-tokio = { version = "1", features = ["sync"] }
-libc = "0.2"
 bytes = "1"
-#xgb-ffi = { path = "../xgb-ffi" }
-
-crossbeam-deque = "0.8"
-crossbeam-utils = "0.8"
+memmap2 = "0.9"
+itoa = "1"
+ryu = "1"
+clap = { version = "4", features = ["derive"] }
+pprof = { version = "0.14", features = ["flamegraph"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+risk-quickscorer = { path = "../risk-quickscorer" }
+risk-quickscorer-standalone-l2 = { path = "../risk-quickscorer-standalone-l2" }
 [features]
 default = []
-# DEPRECATED: xgb_ffi backend is kept only for offline comparison.
-xgb_ffi = ["dep:xgb_ffi"]
-native_l1_m2cgen = []
-native_l1_tl2cgen = []
-native_l2_tl2cgen = []
-
-
-[build-dependencies]
-cc = "1"

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 risk-core = { path = "../risk-core", default-features = false }
+risk-quickscorer-standalone-l2 = { path = "../risk-quickscorer-standalone-l2" }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,10 +20,3 @@ uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
-
-[features]
-default = ["xgb_ffi"]
-xgb_ffi = ["risk-core/xgb_ffi"]
-native_l1_tl2cgen = ["risk-core/native_l1_tl2cgen"]
-native_l1_m2cgen = ["risk-core/native_l1_m2cgen"]
-native_l2_tl2cgen = ["risk-core/native_l2_tl2cgen"]

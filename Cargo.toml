@@ -2,9 +2,12 @@
 resolver = "2"
 members = [
   "crates/risk-core",
+  "crates/risk-quickscorer",
+  "crates/risk-quickscorer-standalone-l2",
   "crates/risk-server-tokio",
   "crates/risk-bench",
   "crates/risk-bench2",
+  "crates/risk-bench3",
   "crates/risk-server-glommio",
   "crates/risk-mamba-kernel",
   "crates/risk_mamba_runner",
@@ -12,9 +15,12 @@ members = [
 ]
 default-members = [
   "crates/risk-core",
+  "crates/risk-quickscorer",
+  "crates/risk-quickscorer-standalone-l2",
   "crates/risk-server-tokio",
   "crates/risk-bench",
   "crates/risk-bench2",
+  "crates/risk-bench3",
   "crates/risk-server-glommio",
   "crates/risk-mamba-kernel",
   "crates/risk_mamba_runner"

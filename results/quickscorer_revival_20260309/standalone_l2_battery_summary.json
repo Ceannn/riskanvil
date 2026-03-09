@@ -1,0 +1,43 @@
+{
+  "runs": [
+    {
+      "file": "run_1.json",
+      "rows_per_sec": 70590.61477917018,
+      "rss_peak_mb": 188.51953125,
+      "direct_decision_rate": 0.9844663810765506,
+      "fallback_rate_active": null
+    },
+    {
+      "file": "run_2.json",
+      "rows_per_sec": 85702.10052841679,
+      "rss_peak_mb": 188.61328125,
+      "direct_decision_rate": 0.9844663810765506,
+      "fallback_rate_active": null
+    },
+    {
+      "file": "run_3.json",
+      "rows_per_sec": 85453.93936212247,
+      "rss_peak_mb": 188.53515625,
+      "direct_decision_rate": 0.9844663810765506,
+      "fallback_rate_active": null
+    },
+    {
+      "file": "run_4.json",
+      "rows_per_sec": 84984.57699542584,
+      "rss_peak_mb": 188.52734375,
+      "direct_decision_rate": 0.9844663810765506,
+      "fallback_rate_active": null
+    },
+    {
+      "file": "run_5.json",
+      "rows_per_sec": 101707.7421519967,
+      "rss_peak_mb": 188.60546875,
+      "direct_decision_rate": 0.9844663810765506,
+      "fallback_rate_active": null
+    }
+  ],
+  "median_rows_per_sec": 85453.93936212247,
+  "mean_rows_per_sec": 85687.7947634264,
+  "best_rows_per_sec": 101707.7421519967,
+  "worst_rows_per_sec": 70590.61477917018
+}

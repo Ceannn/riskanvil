@@ -9,18 +9,19 @@ use std::io::Write as _;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use risk_core::{
-    config::Config, pipeline::AppCore, schema::ScoreRequest, util::now_us, xgb_pool::XgbPoolError,
+    config::Config, pipeline::{AppCore, StandaloneL2TauMode}, quickscorer::QuickRouteMeta, schema::Decision, util::now_us,
 };
+use risk_quickscorer_standalone_l2::StandaloneL2Runtime;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::path::Path;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod mamba_runtime;
@@ -29,7 +30,18 @@ use mamba_runtime::{
 };
 
 static TRACE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
-const L2_EXTRA_MAX: usize = 32;
+const GLOMMIO_IO_MEMORY_BYTES: usize = 1 << 20;
+const GLOMMIO_CONN_STASH_BYTES: usize = 8 * 1024;
+const GLOMMIO_CONN_READ_BUF_BYTES: usize = 8 * 1024;
+const GLOMMIO_CONN_OUT_BYTES: usize = 512;
+const GLOMMIO_CONN_STASH_RETAIN_LIMIT_BYTES: usize = 32 * 1024;
+const GLOMMIO_CONN_OUT_RETAIN_LIMIT_BYTES: usize = 4 * 1024;
+
+#[derive(Clone, Debug)]
+struct DenseRequest {
+    payload: Bytes,
+    route_meta: Option<QuickRouteMeta>,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -37,6 +49,8 @@ struct AppState {
     prom: PrometheusHandle,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: usize,
+    standalone_l2_bench: Option<Arc<StandaloneL2Runtime>>,
+    standalone_l2_tau_mode: Option<StandaloneL2TauMode>,
     mamba: Option<Arc<MambaRuntime>>,
     mamba_policy_hash: String,
 }
@@ -96,21 +110,33 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: String,
 
-    /// 可选：启用 XGB 在线推理（指向模型目录）
+    /// 可选：启用 QuickScorer bundle（目录根）
     #[arg(long)]
-    model_dir: Option<String>,
-
-    /// 可选：启用 L2 模型（指向 L2 模型目录）
-    #[arg(long)]
-    model_l2_dir: Option<String>,
+    bundle_dir: Option<String>,
 
     /// HTTP 层最大并发（超出直接 429），用于保护服务端排队不会失控
     #[arg(long, default_value_t = 4096)]
     max_in_flight: usize,
 
-    /// 启动后预热次数（仅当启用 --model-dir 时生效；0=不预热）
+    /// 启动后预热次数（保留占位；当前 QuickScorer 无显式 warmup）
     #[arg(long, default_value_t = 100)]
     warmup_iters: usize,
+
+    /// Benchmark-only synthetic L2 mode: standalone-sidecar
+    #[arg(long, value_parser = ["standalone-sidecar"])]
+    l2_bench_mode: Option<String>,
+
+    /// Optional override for standalone L2 89-dim feat_bin
+    #[arg(long)]
+    l2_bench_feat_bin: Option<String>,
+
+    /// Tau source for benchmark-only standalone L2: request|fixed
+    #[arg(long, value_parser = ["request", "fixed"], default_value = "request")]
+    l2_bench_tau_mode: String,
+
+    /// Fixed tau used when --l2-bench-tau-mode=fixed
+    #[arg(long)]
+    l2_bench_fixed_tau: Option<f32>,
 
     /// 可选：启用 Mamba stateless 推理（bundle 目录）
     #[arg(long)]
@@ -215,15 +241,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let core = if let Some(dir) = args.model_dir.as_deref() {
-        tracing::info!("XGB enabled, loading L1 model_dir={}", dir);
-        Arc::new(AppCore::new_with_xgb_l1_l2(
-            cfg,
-            dir,
-            args.model_l2_dir.as_deref(),
-        )?)
+    let core = if let Some(dir) = args.bundle_dir.as_deref() {
+        tracing::info!("QuickScorer enabled, loading bundle_dir={}", dir);
+        Arc::new(AppCore::new_with_quickscorer_bundle(cfg, dir)?)
     } else {
-        tracing::info!("XGB disabled, baseline /score only");
+        tracing::info!("QuickScorer disabled");
         Arc::new(AppCore::new(cfg))
     };
 
@@ -301,49 +323,57 @@ fn main() -> anyhow::Result<()> {
         prom,
         in_flight: Arc::new(AtomicUsize::new(0)),
         max_in_flight: args.max_in_flight,
+        standalone_l2_bench: if args.l2_bench_mode.as_deref() == Some("standalone-sidecar") {
+            Some(if let Some(path) = args.l2_bench_feat_bin.as_deref() {
+                Arc::new(StandaloneL2Runtime::load_with_feat_bin_override(
+                    Path::new(args.bundle_dir.as_deref().unwrap_or_default()),
+                    Some(Path::new(path)),
+                )?)
+            } else {
+                Arc::new(StandaloneL2Runtime::load(
+                    Path::new(args.bundle_dir.as_deref().unwrap_or_default()),
+                )?)
+            })
+        } else {
+            None
+        },
+        standalone_l2_tau_mode: if args.l2_bench_mode.as_deref() == Some("standalone-sidecar") {
+            Some(match args.l2_bench_tau_mode.as_str() {
+                "fixed" => StandaloneL2TauMode::Fixed(
+                    args.l2_bench_fixed_tau.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--l2-bench-fixed-tau is required when --l2-bench-tau-mode=fixed"
+                        )
+                    })?,
+                ),
+                _ => StandaloneL2TauMode::Request,
+            })
+        } else {
+            None
+        },
         mamba,
         mamba_policy_hash,
     };
 
-    // ====== Startup: print L1/L2 backend + policy thresholds + schema hash ======
-    if let Some(xgb1) = state.core.xgb.as_ref() {
+    // ====== Startup: print QuickScorer backend/dim/threshold ======
+    if let Some(q) = state.core.quick.as_ref() {
+        let dbg = q.debug_info();
         tracing::info!(
-            "L1 loaded: backend={} model_dir={} dim={} schema_hash={} thresholds: review={} deny={}",
-            xgb1.backend_name(),
-            xgb1.model_dir.display(),
-            xgb1.feature_names.len(),
-            xgb1.schema_hash_hex(),
-            xgb1.policy.review_threshold,
-            xgb1.policy.deny_threshold,
+            "QuickScorer loaded: backend={} l1_dim={} l2_dim={} l1_thr={} fold={} gb_target={} segmented={} seg_cols={:?}",
+            dbg.backend,
+            dbg.l1_dim,
+            dbg.l2_dim,
+            dbg.l1_threshold,
+            dbg.l2_default_fold,
+            dbg.l2_gb_target,
+            dbg.l2_segmented,
+            dbg.l2_seg_cols
         );
-        if xgb1.backend_name() == "xgb_ffi" {
-            tracing::warn!("xgb_ffi backend is deprecated; use native_tl2cgen");
-        }
-    }
-    if let Some(xgb2) = state.core.xgb_l2.as_ref() {
-        tracing::info!(
-            "L2 loaded: backend={} model_dir={} dim={} schema_hash={} thresholds: review={} deny={}",
-            xgb2.backend_name(),
-            xgb2.model_dir.display(),
-            xgb2.feature_names.len(),
-            xgb2.schema_hash_hex(),
-            xgb2.policy.review_threshold,
-            xgb2.policy.deny_threshold,
-        );
-        if xgb2.backend_name() == "xgb_ffi" {
-            tracing::warn!("xgb_ffi backend is deprecated; use native_tl2cgen");
-        }
-    } else if args.model_dir.is_some() {
-        tracing::info!("L2 disabled");
+    } else if args.bundle_dir.is_some() {
+        tracing::warn!("QuickScorer not enabled");
     }
 
-    // ✅ 预热只做一次（避免每个 executor 重复跑）
-    if args.model_dir.is_some() && args.warmup_iters > 0 {
-        let t = std::time::Instant::now();
-        tracing::info!("warmup_xgb start iters={}", args.warmup_iters);
-        state.core.warmup_xgb(args.warmup_iters)?;
-        tracing::info!("warmup_xgb done cost={}ms", t.elapsed().as_millis());
-    }
+    // QuickScorer currently has no explicit warmup hook.
 
     if let Ok(cpus) = get_self_affinity_cpus() {
         tracing::info!("process affinity cpus={:?}", cpus);
@@ -373,6 +403,10 @@ fn main() -> anyhow::Result<()> {
         let per_core_in_flight2 = per_core_in_flight as u64;
         let h = LocalExecutorBuilder::new(Placement::Unbound)
             .name("risk-glommio-io")
+            // This server is network-bound; the default 10 MiB registered buffer
+            // per shard needlessly burns RLIMIT_MEMLOCK and triggers io_uring
+            // ENOMEM warnings under multi-shard startup.
+            .io_memory(GLOMMIO_IO_MEMORY_BYTES)
             .spawn(move || async move {
                 run_accept_loop(
                     addr2,
@@ -392,6 +426,10 @@ fn main() -> anyhow::Result<()> {
             let name = format!("risk-glommio-io-cpu{}", cpu);
             let h = LocalExecutorBuilder::new(Placement::Fixed(cpu))
                 .name(&name)
+                // Keep registered io_uring buffers small; this binary does not
+                // do heavy storage I/O and otherwise 6 shards can exceed the
+                // default memlock budget on WSL/Linux.
+                .io_memory(GLOMMIO_IO_MEMORY_BYTES)
                 .spawn(move || async move {
                     // glommio::net::TcpListener::bind() 会设置 SO_REUSEPORT，允许多 executor 同地址并行 accept。
                     run_accept_loop(
@@ -457,10 +495,10 @@ async fn handle_conn(
     st: AppState,
     core_sem: Rc<Semaphore>,
 ) -> anyhow::Result<()> {
-    let mut stash: BytesMut = BytesMut::with_capacity(64 * 1024);
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut stash: BytesMut = BytesMut::with_capacity(GLOMMIO_CONN_STASH_BYTES);
+    let mut buf = vec![0u8; GLOMMIO_CONN_READ_BUF_BYTES];
     // 连接级复用：避免每个请求都重新分配响应 buffer
-    let mut out: Vec<u8> = Vec::with_capacity(256);
+    let mut out: Vec<u8> = Vec::with_capacity(GLOMMIO_CONN_OUT_BYTES);
 
     loop {
         // 1) 读到 header 结束
@@ -535,31 +573,11 @@ async fn handle_conn(
             write_http(&mut stream, &mut out, 200, "text/plain", b"ok", keep_alive).await?;
         } else if meta.method == "GET" && meta.path == "/debug/backend" {
             // Lightweight introspection for verifying L1/L2 wiring, schema, and thresholds.
-            let l1 = st.core.xgb.as_ref();
-            let l2 = st.core.xgb_l2.as_ref();
+            let quick = st.core.quick.as_ref();
             let l2_ctrl = st.core.l2_ctrl();
 
             let body = json!({
-                "l1": l1.map(|m| json!({
-                    "backend": m.backend_name(),
-                    "model_dir": m.model_dir.to_string_lossy(),
-                    "feature_dim": m.feature_names.len(),
-                    "schema_hash": m.schema_hash_hex(),
-                    "thresholds": {
-                        "review": m.policy.review_threshold,
-                        "deny": m.policy.deny_threshold,
-                    },
-                })),
-                "l2": l2.map(|m| json!({
-                    "backend": m.backend_name(),
-                    "model_dir": m.model_dir.to_string_lossy(),
-                    "feature_dim": m.feature_names.len(),
-                    "schema_hash": m.schema_hash_hex(),
-                    "thresholds": {
-                        "review": m.policy.review_threshold,
-                        "deny": m.policy.deny_threshold,
-                    },
-                })),
+                "quickscorer": quick.map(|q| q.debug_info()),
                 "router_l2": {
                     "sample_ratio": l2_ctrl.sample_ratio(),
                     "sample_base_ratio": l2_ctrl.sample_base_ratio(),
@@ -576,19 +594,6 @@ async fn handle_conn(
                 200,
                 "application/json",
                 &buf,
-                keep_alive,
-            )
-            .await?;
-        } else if meta.method == "POST" && meta.path == "/score" {
-            let req: ScoreRequest = serde_json::from_slice(body.as_ref())?;
-            let resp = st.core.score(req);
-            let body = serde_json::to_vec(&resp)?;
-            write_http(
-                &mut stream,
-                &mut out,
-                200,
-                "application/json",
-                &body,
                 keep_alive,
             )
             .await?;
@@ -735,96 +740,6 @@ async fn handle_conn(
                 keep_alive,
             )
             .await?;
-        } else if meta.method == "POST"
-            && (meta.path == "/score_xgb" || meta.path == "/score_xgb_pool")
-        {
-            // ✅ 统一走 pool（避免把 CPU-bound 推理塞进 glommio reactor）
-            let t_parse = std::time::Instant::now();
-
-            let v: Value = match serde_json::from_slice(body.as_ref()) {
-                Ok(v) => v,
-                Err(e) => {
-                    let msg = format!("invalid json body: {}", e);
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        400,
-                        "text/plain",
-                        msg.as_bytes(),
-                        keep_alive,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-
-            let parse_us: u64 = t_parse.elapsed().as_micros() as u64;
-
-            let obj = match v {
-                Value::Object(m) => {
-                    if let Some(Value::Object(features)) = m.get("features") {
-                        features.clone()
-                    } else {
-                        m
-                    }
-                }
-                _ => {
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        400,
-                        "text/plain",
-                        b"expected json object",
-                        keep_alive,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-
-            // HTTP 层背压：超出并发上限就直接 429（避免服务端排队雪球）
-            let (_g, _p) = match try_acquire_inflight(&st, core_sem.as_ref()) {
-                Some(g) => g,
-                None => {
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        429,
-                        "text/plain",
-                        b"overloaded",
-                        keep_alive,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-
-            match st.core.score_xgb_pool_async(parse_us, &obj).await {
-                Ok(resp) => {
-                    let body = serde_json::to_vec(&resp)?;
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        200,
-                        "application/json",
-                        &body,
-                        keep_alive,
-                    )
-                    .await?;
-                }
-                Err(e) => {
-                    let (code, msg) = map_xgb_error(&e);
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        code,
-                        "text/plain",
-                        msg.as_bytes(),
-                        keep_alive,
-                    )
-                    .await?;
-                }
-            }
         } else if meta.method == "POST" && meta.path == "/score_dense_f32_bin" {
             // ✅ bench2/bench3 主压测口：dense f32le -> RSK1 (48B)
             let t0 = std::time::Instant::now();
@@ -846,43 +761,25 @@ async fn handle_conn(
                 }
             };
 
-            // 必须启用 XGB + pool
-            let xgb = match st.core.xgb.as_ref() {
-                Some(x) => x,
+            let (dim, _) = match st.core.quick_dims() {
+                Some(v) => v,
                 None => {
                     write_http(
                         &mut stream,
                         &mut out,
                         500,
                         "text/plain",
-                        b"xgb not enabled",
+                        b"quickscorer not enabled",
                         keep_alive,
                     )
                     .await?;
                     continue;
                 }
             };
-            let pool = match st.core.xgb_pool.as_ref() {
-                Some(p) => p,
-                None => {
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        500,
-                        "text/plain",
-                        b"xgb_pool not enabled",
-                        keep_alive,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-
-            let dim = xgb.feature_names.len();
 
             // parse payload (raw bytes or RVEC header)
             let t_parse = std::time::Instant::now();
-            let payload = match parse_dense_payload_le(&body, dim) {
+            let req = match parse_dense_payload_le(&body, dim) {
                 Ok(p) => p,
                 Err(msg) => {
                     write_http(
@@ -899,68 +796,33 @@ async fn handle_conn(
             };
             let parse_us = now_us(t_parse);
 
-            // submit to XgbPool (bounded queue => fast fail)
-            // Keep a cheap clone of Bytes so we can optionally reuse the same payload for L2.
-            let payload_for_l2 = payload.clone();
-
-            // Optional: stateful L2 (local feature store). We update the store on EVERY request
-            // so that when we route a request to L2 we can build velocity / aggregation / graph features
-            // in Rust without Redis.
-            let mut feature_us: u64 = 0;
-            let mut stateful_ctx = None;
-            if let Some(aug) = st.core.stateful_l2.as_ref() {
-                let (ctx, t) = aug.pre_l1(&payload_for_l2);
-                feature_us = feature_us.saturating_add(t.pre_l1_us);
-                stateful_ctx = Some(ctx);
-            }
-
-            let budget = std::time::Duration::from_millis(st.core.cfg.slo_p99_ms.max(1));
-            let deadline = t0 + budget;
-
-            let t_xgb = std::time::Instant::now();
-            let rx = match pool.try_submit_dense_bytes_le(payload, dim, 0) {
-                Ok(rx) => rx,
-                Err(e) => {
-                    let (code, msg) = map_xgb_pool_err(&e);
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        code,
-                        "text/plain",
-                        msg.as_bytes(),
-                        keep_alive,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-
-            // 与 tokio 版本的“端到端预算”语义对齐：超过 SLO 预算的请求直接 429（快速、可预测）。
-            let rx_res = match glommio::timer::timeout(budget, async move {
-                Ok::<_, glommio::GlommioError<()>>(rx.await)
-            })
-            .await
+            let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+            let sidecar_row_idx = req
+                .route_meta
+                .as_ref()
+                .map(|m| m.row_idx as usize)
+                .unwrap_or(trace_id as usize);
+            let resp = match if let (Some(rt), Some(tau_mode)) =
+                (st.standalone_l2_bench.as_ref(), st.standalone_l2_tau_mode)
             {
-                Ok(v) => v,
-                Err(_) => {
-                    risk_core::batched_counter!("xgb_deadline_exceeded_total").increment(1);
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        429,
-                        "text/plain",
-                        b"xgb deadline exceeded",
-                        keep_alive,
+                st.core
+                    .score_quick_dense_bytes_with_standalone_bench_l2_async(
+                        parse_us,
+                        req.payload,
+                        req.route_meta,
+                        rt,
+                        sidecar_row_idx,
+                        tau_mode,
                     )
-                    .await?;
-                    continue;
-                }
-            };
-
-            let out1 = match rx_res {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    let msg = format!("xgb inference failed: {:#}", e);
+                    .await
+            } else {
+                st.core
+                    .score_quick_dense_bytes_with_meta_async(parse_us, req.payload, req.route_meta)
+                    .await
+            } {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let msg = format!("quickscorer inference failed: {:#}", e);
                     write_http(
                         &mut stream,
                         &mut out,
@@ -972,186 +834,29 @@ async fn handle_conn(
                     .await?;
                     continue;
                 }
-                Err(_) => {
-                    write_http(
-                        &mut stream,
-                        &mut out,
-                        503,
-                        "text/plain",
-                        b"xgb canceled",
-                        keep_alive,
-                    )
-                    .await?;
-                    continue;
-                }
             };
-
-            let xgb_us = now_us(t_xgb);
-            risk_core::sampled_histogram!("stage_xgb_us").record(xgb_us as f64);
-
-            let mut l2_us: u64 = 0;
-
-            // router: L1 decision + optional L2
-            let mut score = out1.score;
-            let mut decision_u8 = decision_str_to_u8(xgb.decide(score));
-            let t_router = std::time::Instant::now();
-
-            // Router: for dense-bytes path we make L2 actually different by optionally appending
-            // stateful features (velocity/aggregation/graph) in Rust.
-            let mut l2_invoked = false;
-
-            if decision_u8 == 2 {
-                if let (Some(xgb2), Some(pool2)) =
-                    (st.core.xgb_l2.as_ref(), st.core.xgb_pool_l2.as_ref())
-                {
-                    let l2_ctrl = st.core.l2_ctrl();
-                    // Budget checks
-                    let now = std::time::Instant::now();
-                    let remaining_us = deadline
-                        .checked_duration_since(now)
-                        .map(|d| d.as_micros() as u64)
-                        .unwrap_or(0);
-
-                    if remaining_us < l2_ctrl.min_remaining_us() {
-                        risk_core::batched_counter!("router_l2_skipped_budget_total").increment(1);
-                        risk_core::batched_counter!("router_l2_skipped_deadline_budget_total").increment(1);
-                    } else if !l2_ctrl.allow_by_rate() {
-                        risk_core::batched_counter!("router_l2_skipped_budget_total").increment(1);
-                        risk_core::batched_counter!("router_l2_skipped_rate_total").increment(1);
-                    } else if !l2_ctrl.allow_by_sample() {
-                        risk_core::batched_counter!("router_l2_skipped_budget_total").increment(1);
-                        risk_core::batched_counter!("router_l2_skipped_sample_total").increment(1);
-                    } else {
-                        let st_waterline =
-                            l2_ctrl.waterline_cached_or_update(|| pool2.stats().queue_waterline());
-                        let max_w = l2_ctrl.max_queue_waterline();
-                        if max_w < 1.0 && st_waterline >= max_w {
-                            risk_core::batched_counter!("router_l2_skipped_budget_total").increment(1);
-                            risk_core::batched_counter!("router_l2_skipped_waterline_total").increment(1);
-                        } else {
-                            // Optional queue-wait budget for L2 pool.
-                            let mut q_budget_us = l2_ctrl.queue_wait_budget_us();
-                            if q_budget_us > 0 {
-                                q_budget_us = q_budget_us.min(remaining_us);
-                            }
-
-                            let t_l2 = std::time::Instant::now();
-                            let submit = if let Some(aug) = st.core.stateful_l2.as_ref() {
-                                let ctx = stateful_ctx.as_ref().expect("stateful ctx missing");
-                                let mut extra = [0.0f32; L2_EXTRA_MAX];
-                                extra[..aug.extra_dim()].copy_from_slice(&ctx.extra);
-                                if q_budget_us > 0 {
-                                    pool2.try_submit_dense_bytes_le_extra_with_budget(
-                                        payload_for_l2,
-                                        dim,
-                                        extra,
-                                        aug.extra_dim(),
-                                        0,
-                                        q_budget_us,
-                                    )
-                                } else {
-                                    pool2.try_submit_dense_bytes_le_extra(
-                                        payload_for_l2,
-                                        dim,
-                                        extra,
-                                        aug.extra_dim(),
-                                        0,
-                                    )
-                                }
-                            } else if q_budget_us > 0 {
-                                pool2.try_submit_dense_bytes_le_with_budget(
-                                    payload_for_l2,
-                                    xgb2.feature_names.len(),
-                                    0,
-                                    q_budget_us,
-                                )
-                            } else {
-                                pool2.try_submit_dense_bytes_le(
-                                    payload_for_l2,
-                                    xgb2.feature_names.len(),
-                                    0,
-                                )
-                            };
-
-                            if let Ok(rx2) = submit {
-                                risk_core::batched_counter!("router_l2_trigger_total").increment(1);
-
-                                let rem = deadline
-                                    .checked_duration_since(std::time::Instant::now())
-                                    .unwrap_or(std::time::Duration::from_millis(0));
-
-                                match glommio::timer::timeout::<
-                                    _,
-                                    anyhow::Result<risk_core::xgb_pool::XgbOut>,
-                                >(rem, async move {
-                                    match rx2.await {
-                                        Ok(r) => Ok::<_, glommio::GlommioError<()>>(r),
-                                        Err(_) => Ok(Err(anyhow::anyhow!("l2 oneshot canceled"))),
-                                    }
-                                })
-                                .await
-                                {
-                                    Ok(Ok(out2)) => {
-                                        l2_us = now_us(t_l2);
-                                        score = out2.score;
-                                        decision_u8 = decision_str_to_u8(xgb2.decide(score));
-                                        l2_invoked = true;
-                                    }
-                                    Ok(Err(e)) => {
-                                        l2_us = now_us(t_l2);
-                                        if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
-                                            if matches!(pe, XgbPoolError::DeadlineExceeded) {
-                                                l2_ctrl.feedback_overload();
-                                                risk_core::batched_counter!(
-                                                    "router_l2_skipped_deadline_budget_total"
-                                                )
-                                                .increment(1);
-                                            }
-                                        }
-                                    }
-                                    Err(_timeout) => {
-                                        l2_us = now_us(t_l2);
-                                        l2_ctrl.feedback_overload();
-                                        risk_core::batched_counter!(
-                                            "router_l2_skipped_deadline_budget_total"
-                                        )
-                                        .increment(1);
-                                    }
-                                }
-
-                                risk_core::sampled_histogram!("stage_l2_us").record(l2_us as f64);
-                            } else {
-                                // L2 pool saturated -> fall back to L1 decision (ManualReview) instead of failing request.
-                                l2_ctrl.feedback_overload();
-                                risk_core::batched_counter!("router_l2_skipped_budget_total").increment(1);
-                                l2_us = 0;
-                                risk_core::sampled_histogram!("stage_l2_us").record(0.0);
-                            }
-                        }
-                    }
-                }
-            }
-
-            let router_us = now_us(t_router);
-            risk_core::sampled_histogram!("stage_router_us").record(router_us as f64);
-            risk_core::sampled_histogram!("stage_feature_us").record(feature_us as f64);
+            let decision_u8 = match resp.decision {
+                Decision::Allow => 0,
+                Decision::Deny => 1,
+                Decision::ManualReview => 2,
+                Decision::DegradeAllow => 3,
+            };
 
             // serialize (RSK1)
             let ser_hist = risk_core::sampled_histogram!("stage_serialize_us");
-            let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
             // NOTE: 序列化耗时本身不能“精确地”写回同一个包（会有轻微递归依赖）。
             // 这里用两步：先用 serialize_us=0 编码，然后把测得的 serialize_us patch 回固定 offset(44..48)。
             let (mut rsk1, ser_us) = if ser_hist.enabled() {
                 let t_ser = std::time::Instant::now();
                 let rsk1 = encode_rsk1(
                     trace_id,
-                    score,
+                    resp.score as f32,
                     decision_u8,
-                    parse_us,
-                    feature_us,
-                    router_us,
-                    xgb_us,
-                    l2_us,
+                    resp.timings_us.parse,
+                    resp.timings_us.feature,
+                    resp.timings_us.router,
+                    resp.timings_us.l1,
+                    resp.timings_us.l2,
                     0,
                 );
                 (rsk1, now_us(t_ser))
@@ -1159,13 +864,13 @@ async fn handle_conn(
                 (
                     encode_rsk1(
                         trace_id,
-                        score,
+                        resp.score as f32,
                         decision_u8,
-                        parse_us,
-                        feature_us,
-                        router_us,
-                        xgb_us,
-                        l2_us,
+                        resp.timings_us.parse,
+                        resp.timings_us.feature,
+                        resp.timings_us.router,
+                        resp.timings_us.l1,
+                        resp.timings_us.l2,
                         0,
                     ),
                     0,
@@ -1184,6 +889,128 @@ async fn handle_conn(
                 "application/octet-stream",
                 &rsk1,
                 keep_alive,
+            )
+            .await?;
+        } else if meta.method == "POST" && meta.path == "/score_dense_f32_bin_v2" {
+            let t0 = std::time::Instant::now();
+
+            let (_g, _p) = match try_acquire_inflight(&st, core_sem.as_ref()) {
+                Some(g) => g,
+                None => {
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        429,
+                        "text/plain",
+                        b"overloaded",
+                        keep_alive,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+
+            let (dim, _) = match st.core.quick_dims() {
+                Some(v) => v,
+                None => {
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        500,
+                        "text/plain",
+                        b"quickscorer not enabled",
+                        keep_alive,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+
+            let t_parse = std::time::Instant::now();
+            let req = match parse_dense_payload_le(&body, dim) {
+                Ok(p) => p,
+                Err(msg) => {
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        400,
+                        "text/plain",
+                        msg.as_bytes(),
+                        keep_alive,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            let parse_us = now_us(t_parse);
+            let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+            let sidecar_row_idx = req
+                .route_meta
+                .as_ref()
+                .map(|m| m.row_idx as usize)
+                .unwrap_or(trace_id as usize);
+            let resp = match if let (Some(rt), Some(tau_mode)) =
+                (st.standalone_l2_bench.as_ref(), st.standalone_l2_tau_mode)
+            {
+                st.core
+                    .score_quick_dense_bytes_with_standalone_bench_l2_async(
+                        parse_us,
+                        req.payload,
+                        req.route_meta,
+                        rt,
+                        sidecar_row_idx,
+                        tau_mode,
+                    )
+                    .await
+            } else {
+                st.core
+                    .score_quick_dense_bytes_with_meta_async(parse_us, req.payload, req.route_meta)
+                    .await
+            } {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let msg = format!("quickscorer inference failed: {:#}", e);
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        500,
+                        "text/plain",
+                        msg.as_bytes(),
+                        keep_alive,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            let decision_u8 = match resp.decision {
+                Decision::Allow => 0,
+                Decision::Deny => 1,
+                Decision::ManualReview => 2,
+                Decision::DegradeAllow => 3,
+            };
+            let qsb2 = encode_qsb2(
+                trace_id,
+                resp.score as f32,
+                decision_u8,
+                resp.timings_us.l2 > 0,
+            );
+            let timings_header = encode_timings_header(
+                resp.timings_us.parse,
+                resp.timings_us.feature,
+                resp.timings_us.router,
+                resp.timings_us.l1,
+                resp.timings_us.l2,
+                resp.timings_us.serialize,
+            );
+            risk_core::sampled_histogram!("e2e_us").record(now_us(t0) as f64);
+            write_http_with_headers(
+                &mut stream,
+                &mut out,
+                200,
+                "application/octet-stream",
+                &qsb2,
+                keep_alive,
+                &[("X-Risk-Timings-Us", timings_header.as_str())],
             )
             .await?;
         } else if meta.method == "GET" && meta.path == "/metrics" {
@@ -1209,9 +1036,25 @@ async fn handle_conn(
             .await?;
         }
 
+        maybe_shrink_conn_buffers(&mut stash, &mut out);
+
         if meta.want_close {
             return Ok(());
         }
+    }
+}
+
+#[inline]
+fn maybe_shrink_conn_buffers(stash: &mut BytesMut, out: &mut Vec<u8>) {
+    if stash.capacity() > GLOMMIO_CONN_STASH_RETAIN_LIMIT_BYTES {
+        let mut trimmed = BytesMut::with_capacity(GLOMMIO_CONN_STASH_BYTES);
+        if !stash.is_empty() {
+            trimmed.extend_from_slice(stash.as_ref());
+        }
+        *stash = trimmed;
+    }
+    if out.capacity() > GLOMMIO_CONN_OUT_RETAIN_LIMIT_BYTES {
+        *out = Vec::with_capacity(GLOMMIO_CONN_OUT_BYTES);
     }
 }
 
@@ -1332,60 +1175,39 @@ fn get_self_affinity_cpus() -> anyhow::Result<Vec<usize>> {
 }
 
 fn read_policy_hash() -> anyhow::Result<String> {
-    let path = std::env::var("MAMBA_POLICY_PATH").unwrap_or_else(|_| "gate_policy_v1_mainline.json".to_string());
+    let path = std::env::var("MAMBA_POLICY_PATH")
+        .unwrap_or_else(|_| "gate_policy_v1_mainline.json".to_string());
     let data = std::fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&data);
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn map_xgb_error(e: &anyhow::Error) -> (u16, String) {
-    if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
-        let (code, msg) = map_xgb_pool_err(pe);
-        return (code, msg);
-    }
-    (500, format!("internal error: {:#}", e))
-}
-
-fn map_xgb_pool_err(e: &XgbPoolError) -> (u16, String) {
-    match e {
-        XgbPoolError::QueueFull => (429, "xgb pool queue full".to_string()),
-        XgbPoolError::DeadlineExceeded => (429, "xgb pool deadline exceeded".to_string()),
-        XgbPoolError::WorkerDown => (503, "xgb pool worker down".to_string()),
-        XgbPoolError::Canceled => (503, "xgb pool canceled".to_string()),
-    }
-}
-
 /// Parse dense payload.
 /// - raw: exactly dim*4 bytes
 /// - RVEC: magic="RVEC"(4) + ver(u16=1) + flags(u16=0) + dim(u32) + reserved(u32) + payload(f32*dim)
-fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<Bytes, String> {
+fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<DenseRequest, String> {
     let expected_len = expected_dim
         .checked_mul(4)
         .ok_or_else(|| "expected_dim too large".to_string())?;
 
     // raw fast path
     if body.len() == expected_len {
-        return Ok(body.clone());
+        return Ok(DenseRequest {
+            payload: body.clone(),
+            route_meta: None,
+        });
     }
 
     // RVEC header
-    if body.len() != 16 + expected_len {
-        return Err(format!(
-            "invalid dense payload size: got {}, expected {} (raw) or {} (RVEC)",
-            body.len(),
-            expected_len,
-            16 + expected_len
-        ));
-    }
     let b = body.as_ref();
+    if b.len() < 16 {
+        return Err(format!("body too short: {} < 16", b.len()));
+    }
     if &b[0..4] != b"RVEC" {
         return Err("invalid dense payload (missing magic RVEC)".into());
     }
     let ver = u16::from_le_bytes([b[4], b[5]]);
-    if ver != 1 {
-        return Err(format!("unsupported RVEC version: {}", ver));
-    }
     let flags = u16::from_le_bytes([b[6], b[7]]);
     if flags != 0 {
         return Err(format!("unsupported RVEC flags: {}", flags));
@@ -1397,17 +1219,73 @@ fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<Bytes, St
             dim, expected_dim
         ));
     }
-    Ok(body.slice(16..))
-}
-
-#[inline]
-fn decision_str_to_u8(s: &str) -> u8 {
-    match s {
-        "allow" => 0,
-        "deny" => 1,
-        "review" | "manual_review" => 2,
-        "degrade_allow" | "degraded_allow" => 3,
-        _ => 2,
+    match ver {
+        1 => {
+            let need = 16 + expected_len;
+            if body.len() != need {
+                return Err(format!(
+                    "invalid dense payload size: got {}, expected {}",
+                    body.len(),
+                    need
+                ));
+            }
+            Ok(DenseRequest {
+                payload: body.slice(16..),
+                route_meta: None,
+            })
+        }
+        2 => {
+            let need = 32 + expected_len;
+            if body.len() != need {
+                return Err(format!(
+                    "invalid dense payload size: got {}, expected {}",
+                    body.len(),
+                    need
+                ));
+            }
+            let fold_id = i32::from_le_bytes([b[12], b[13], b[14], b[15]]);
+            let seg_prod_amtbin = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
+            let transaction_id =
+                u64::from_le_bytes([b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]]);
+            let row_idx = u32::from_le_bytes([b[28], b[29], b[30], b[31]]);
+            Ok(DenseRequest {
+                payload: body.slice(32..),
+                route_meta: Some(QuickRouteMeta {
+                    row_idx,
+                    transaction_id,
+                    fold_id,
+                    seg_prod_amtbin,
+                    l2_tau_used: None,
+                }),
+            })
+        }
+        3 => {
+            let need = 40 + expected_len;
+            if body.len() != need {
+                return Err(format!(
+                    "invalid dense payload size: got {}, expected {}",
+                    body.len(),
+                    need
+                ));
+            }
+            let fold_id = i32::from_le_bytes([b[12], b[13], b[14], b[15]]);
+            let seg_prod_amtbin = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
+            let transaction_id =
+                u64::from_le_bytes([b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]]);
+            let row_idx = u32::from_le_bytes([b[28], b[29], b[30], b[31]]);
+            let l2_tau_used = f32::from_le_bytes([b[32], b[33], b[34], b[35]]);
+            Ok(DenseRequest {
+                payload: body.slice(40..),
+                route_meta: Some(QuickRouteMeta {
+                    row_idx,
+                    transaction_id,
+                    fold_id,
+                    seg_prod_amtbin,
+                    l2_tau_used: Some(l2_tau_used),
+                }),
+            })
+        }
+        _ => Err(format!("unsupported RVEC version: {}", ver)),
     }
 }
 
@@ -1419,7 +1297,7 @@ fn decision_str_to_u8(s: &str) -> u8 {
 /// - trace_id(u64)
 /// - score(f32)
 /// - decision(u8) + pad[3]
-/// - timings[6] u32: parse, feature, router, xgb, l2, serialize
+/// - timings[6] u32: parse, feature, router, l1, l2, serialize
 fn encode_rsk1(
     trace_id: u64,
     score: f32,
@@ -1427,7 +1305,7 @@ fn encode_rsk1(
     parse_us: u64,
     feature_us: u64,
     router_us: u64,
-    xgb_us: u64,
+    l1_us: u64,
     l2_us: u64,
     serialize_us: u64,
 ) -> Vec<u8> {
@@ -1455,12 +1333,40 @@ fn encode_rsk1(
     out.extend_from_slice(&clamp_u32(parse_us).to_le_bytes());
     out.extend_from_slice(&clamp_u32(feature_us).to_le_bytes());
     out.extend_from_slice(&clamp_u32(router_us).to_le_bytes());
-    out.extend_from_slice(&clamp_u32(xgb_us).to_le_bytes());
+    out.extend_from_slice(&clamp_u32(l1_us).to_le_bytes());
     out.extend_from_slice(&clamp_u32(l2_us).to_le_bytes());
     out.extend_from_slice(&clamp_u32(serialize_us).to_le_bytes());
 
     debug_assert_eq!(out.len(), 48);
     out
+}
+
+#[inline]
+fn encode_qsb2(trace_id: u64, score: f32, decision: u8, used_l2: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    out.extend_from_slice(b"QSB2");
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.push(decision);
+    out.push(if used_l2 { 1 } else { 0 });
+    out.extend_from_slice(&trace_id.to_le_bytes());
+    out.extend_from_slice(&score.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    debug_assert_eq!(out.len(), 24);
+    out
+}
+
+fn encode_timings_header(
+    parse_us: u64,
+    feature_us: u64,
+    router_us: u64,
+    l1_us: u64,
+    l2_us: u64,
+    serialize_us: u64,
+) -> String {
+    format!(
+        "{},{},{},{},{},{}",
+        parse_us, feature_us, router_us, l1_us, l2_us, serialize_us
+    )
 }
 
 #[inline]
@@ -1537,6 +1443,18 @@ async fn write_http(
     body: &[u8],
     keep_alive: bool,
 ) -> anyhow::Result<()> {
+    write_http_with_headers(stream, scratch, code, ctype, body, keep_alive, &[]).await
+}
+
+async fn write_http_with_headers(
+    stream: &mut glommio::net::TcpStream,
+    scratch: &mut Vec<u8>,
+    code: u16,
+    ctype: &str,
+    body: &[u8],
+    keep_alive: bool,
+    extra_headers: &[(&str, &str)],
+) -> anyhow::Result<()> {
     let status = match code {
         200 => "OK",
         400 => "Bad Request",
@@ -1552,20 +1470,14 @@ async fn write_http(
     // 关键：复用 scratch，合并 header+body，一次性写出，避免 Nagle/delayed-ack 造成 ~40ms 抖动 + 避免每请求分配
     scratch.clear();
     // Vec<u8> 实现了 std::io::Write，所以 write! 不会额外分配 String。
-    write!(
-        scratch,
-        "HTTP/1.1 {} {}
-Content-Type: {}
-Content-Length: {}
-Connection: {}
-
-",
-        code,
-        status,
-        ctype,
-        body.len(),
-        conn
-    )?;
+    write!(scratch, "HTTP/1.1 {} {}\r\n", code, status)?;
+    write!(scratch, "Content-Type: {}\r\n", ctype)?;
+    write!(scratch, "Content-Length: {}\r\n", body.len())?;
+    write!(scratch, "Connection: {}\r\n", conn)?;
+    for (name, value) in extra_headers {
+        write!(scratch, "{}: {}\r\n", name, value)?;
+    }
+    scratch.extend_from_slice(b"\r\n");
     scratch.extend_from_slice(body);
 
     stream.write_all(scratch).await?;

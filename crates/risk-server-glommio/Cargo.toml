@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 risk-core = { path = "../risk-core", default-features = false }
+risk-quickscorer-standalone-l2 = { path = "../risk-quickscorer-standalone-l2" }
 risk-mamba-kernel = { path = "../risk-mamba-kernel" }
 
 bytes = "1"
@@ -27,12 +28,3 @@ anyhow = "1"
 
 # Used to read the current process CPU affinity mask (Linux).
 libc = "0.2"
-
-[features]
-default = []
-
-# Convenience pass-through features so you can run:
-#   cargo build -p risk-server-glommio --no-default-features --features native_l1_tl2cgen,native_l2_tl2cgen
-xgb_ffi = ["risk-core/xgb_ffi"]
-native_l1_tl2cgen = ["risk-core/native_l1_tl2cgen"]
-native_l2_tl2cgen = ["risk-core/native_l2_tl2cgen"]

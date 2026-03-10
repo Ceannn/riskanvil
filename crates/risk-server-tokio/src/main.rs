@@ -6,7 +6,8 @@ use axum::{
     body::Bytes,
     error_handling::HandleErrorLayer,
     extract::State,
-    http::{header, HeaderName, HeaderValue, StatusCode},
+    http,
+    http::{header, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -15,12 +16,13 @@ use clap::Parser;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use risk_core::{
     config::Config,
-    pipeline::StandaloneL2TauMode,
     pipeline::AppCore,
+    pipeline::StandaloneL2TauMode,
     quickscorer::QuickRouteMeta,
     schema::{Decision, ScoreResponse},
 };
 use risk_quickscorer_standalone_l2::StandaloneL2Runtime;
+use tokio::sync::Semaphore as TokioSemaphore;
 use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer};
 use tracing::{error, info, warn};
@@ -64,6 +66,10 @@ struct Args {
     /// Fixed tau used when --l2-bench-tau-mode=fixed
     #[arg(long)]
     l2_bench_fixed_tau: Option<f32>,
+
+    /// Benchmark-only h2c listen addr for risk-bench3, e.g. 127.0.0.1:19092
+    #[arg(long)]
+    bench3_h2_listen: Option<String>,
 }
 
 #[derive(Clone)]
@@ -72,6 +78,7 @@ struct AppState {
     prom: PrometheusHandle,
     standalone_l2_bench: Option<Arc<StandaloneL2Runtime>>,
     standalone_l2_tau_mode: Option<StandaloneL2TauMode>,
+    bench_in_flight: Arc<TokioSemaphore>,
 }
 
 static TRACE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -241,6 +248,56 @@ fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<DenseRequ
     }
 }
 
+async fn score_dense_binary_request(
+    st: &AppState,
+    body: Bytes,
+) -> Result<(u64, ScoreResponse), (StatusCode, String)> {
+    let t_parse = Instant::now();
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quickscorer not enabled: start server with --bundle-dir".to_string(),
+        ));
+    };
+
+    let req = parse_dense_payload_le(&body, expected_dim)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let parse_us = t_parse.elapsed().as_micros() as u64;
+
+    let resp = if let (Some(rt), Some(tau_mode)) =
+        (st.standalone_l2_bench.as_ref(), st.standalone_l2_tau_mode)
+    {
+        let sidecar_row_idx = req
+            .route_meta
+            .as_ref()
+            .map(|m| m.row_idx as usize)
+            .unwrap_or(trace_id as usize);
+        st.core
+            .score_quick_dense_bytes_with_standalone_bench_l2_async(
+                parse_us,
+                req.payload,
+                req.route_meta,
+                rt,
+                sidecar_row_idx,
+                tau_mode,
+            )
+            .await
+    } else {
+        st.core
+            .score_quick_dense_bytes_with_meta_async(parse_us, req.payload, req.route_meta)
+            .await
+    }
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("quickscorer inference failed: {:#}", e),
+        )
+    })?;
+
+    Ok((trace_id, resp))
+}
+
 fn decision_to_u8(d: &Decision) -> u8 {
     match d {
         Decision::Allow => 0,
@@ -331,54 +388,137 @@ fn encode_timings_header_value(resp: &ScoreResponse) -> Option<HeaderValue> {
     .ok()
 }
 
+async fn handle_h2_bench_stream(
+    req: http::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    st: AppState,
+) -> anyhow::Result<()> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    if method != Method::POST {
+        let response = http::Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(())
+            .context("build h2 method-not-allowed response")?;
+        let mut send = respond
+            .send_response(response, false)
+            .context("send h2 method-not-allowed headers")?;
+        send.send_data(Bytes::from_static(b"method not allowed"), true)
+            .context("send h2 method-not-allowed body")?;
+        return Ok(());
+    }
+
+    if path != "/score_dense_f32_bin" && path != "/score_dense_f32_bin_v2" {
+        let response = http::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(())
+            .context("build h2 not-found response")?;
+        let mut send = respond
+            .send_response(response, false)
+            .context("send h2 not-found headers")?;
+        send.send_data(Bytes::from_static(b"not found"), true)
+            .context("send h2 not-found body")?;
+        return Ok(());
+    }
+
+    let _permit = st
+        .bench_in_flight
+        .clone()
+        .acquire_owned()
+        .await
+        .context("acquire h2 bench permit")?;
+
+    let mut body_stream = req.into_body();
+    let mut body = bytes::BytesMut::with_capacity(4096);
+    while let Some(chunk) = body_stream.data().await {
+        let chunk = chunk.context("read h2 request body")?;
+        body.extend_from_slice(&chunk);
+        let _ = body_stream.flow_control().release_capacity(chunk.len());
+    }
+    let body = body.freeze();
+
+    let outcome = match path.as_str() {
+        "/score_dense_f32_bin" => score_dense_binary_request(&st, body).await.map(|(trace_id, resp)| {
+            let bin = encode_rsk1_response(trace_id, &resp);
+            let headers: Vec<(HeaderName, HeaderValue)> = vec![(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            )];
+            (StatusCode::OK, headers, Bytes::from(bin))
+        }),
+        "/score_dense_f32_bin_v2" => score_dense_binary_request(&st, body).await.map(|(trace_id, resp)| {
+            let mut headers = vec![(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            )];
+            if let Some(v) = encode_timings_header_value(&resp) {
+                headers.push((HDR_RISK_TIMINGS_US, v));
+            }
+            (StatusCode::OK, headers, Bytes::from(encode_qsb2_response(trace_id, &resp)))
+        }),
+        _ => unreachable!("path already validated"),
+    };
+
+    let (status, headers, body) = match outcome {
+        Ok(ok) => ok,
+        Err((status, msg)) => (
+            status,
+            vec![(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))],
+            Bytes::from(msg),
+        ),
+    };
+
+    let mut builder = http::Response::builder().status(status);
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    let response = builder.body(()).context("build h2 response")?;
+    let mut send = respond.send_response(response, false).context("send h2 headers")?;
+    send.send_data(body, true).context("send h2 body")?;
+    Ok(())
+}
+
+async fn handle_h2_bench_conn(
+    stream: tokio::net::TcpStream,
+    st: AppState,
+) -> anyhow::Result<()> {
+    let mut conn = h2::server::handshake(stream)
+        .await
+        .context("h2 server handshake")?;
+    while let Some(result) = conn.accept().await {
+        let (req, respond) = result.context("accept h2 stream")?;
+        let st2 = st.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_h2_bench_stream(req, respond, st2).await {
+                warn!(error = %e, "h2 bench stream failed");
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn run_h2_bench_listener(addr: SocketAddr, st: AppState) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("bench3 h2c listening on h2c://{}", addr);
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        stream.set_nodelay(true).ok();
+        let st2 = st.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_h2_bench_conn(stream, st2).await {
+                warn!(peer = %peer, error = %e, "h2 bench conn failed");
+            }
+        });
+    }
+}
+
 /// ✅ Dense f32 直传 + Binary response（application/octet-stream）
 /// 请求体为 raw f32le 或带 RVEC header 的 dense payload。
 async fn score_dense_f32_bin(State(st): State<AppState>, body: Bytes) -> Response {
-    let t0 = Instant::now();
-
-    let Some((expected_dim, _)) = st.core.quick_dims() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "quickscorer not enabled: start server with --bundle-dir",
-        )
-            .into_response();
-    };
-
-    let req = match parse_dense_payload_le(&body, expected_dim) {
-        Ok(v) => v,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
-    };
-
-    let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    let parse_us = t0.elapsed().as_micros() as u64;
-
-    let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    let res = if let (Some(rt), Some(tau_mode)) =
-        (st.standalone_l2_bench.as_ref(), st.standalone_l2_tau_mode)
-    {
-        let sidecar_row_idx = req
-            .route_meta
-            .as_ref()
-            .map(|m| m.row_idx as usize)
-            .unwrap_or(trace_id as usize);
-        st.core
-            .score_quick_dense_bytes_with_standalone_bench_l2_async(
-                parse_us,
-                req.payload,
-                req.route_meta,
-                rt,
-                sidecar_row_idx,
-                tau_mode,
-            )
-            .await
-    } else {
-        st.core
-            .score_quick_dense_bytes_with_meta_async(parse_us, req.payload, req.route_meta)
-            .await
-    };
-
-    match res {
-        Ok(resp) => {
+    match score_dense_binary_request(&st, body).await {
+        Ok((trace_id, resp)) => {
             // 让 timings.serialize 代表二进制序列化时间（而不是 core 侧的 JSON to_vec 计时）。
             let t_ser = Instant::now();
             // 先用旧值编码，拿到真实编码开销后再写回再编码一遍会多一次分配。
@@ -396,58 +536,16 @@ async fn score_dense_f32_bin(State(st): State<AppState>, body: Bytes) -> Respons
             // trace_id 只在错误时打日志，避免热路径噪声；客户端会拿到 trace_id。
             r
         }
-        Err(e) => {
-            error!(error = %e, trace_id = trace_id, "score_dense_f32_bin failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        Err((status, msg)) => {
+            error!(error = %msg, "score_dense_f32_bin failed");
+            (status, msg).into_response()
         }
     }
 }
 
 async fn score_dense_f32_bin_v2(State(st): State<AppState>, body: Bytes) -> Response {
-    let t0 = Instant::now();
-
-    let Some((expected_dim, _)) = st.core.quick_dims() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "quickscorer not enabled: start server with --bundle-dir",
-        )
-            .into_response();
-    };
-
-    let req = match parse_dense_payload_le(&body, expected_dim) {
-        Ok(v) => v,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
-    };
-
-    let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    let parse_us = t0.elapsed().as_micros() as u64;
-
-    let res = if let (Some(rt), Some(tau_mode)) =
-        (st.standalone_l2_bench.as_ref(), st.standalone_l2_tau_mode)
-    {
-        let sidecar_row_idx = req
-            .route_meta
-            .as_ref()
-            .map(|m| m.row_idx as usize)
-            .unwrap_or(trace_id as usize);
-        st.core
-            .score_quick_dense_bytes_with_standalone_bench_l2_async(
-                parse_us,
-                req.payload,
-                req.route_meta,
-                rt,
-                sidecar_row_idx,
-                tau_mode,
-            )
-            .await
-    } else {
-        st.core
-            .score_quick_dense_bytes_with_meta_async(parse_us, req.payload, req.route_meta)
-            .await
-    };
-
-    match res {
-        Ok(resp) => {
+    match score_dense_binary_request(&st, body).await {
+        Ok((trace_id, resp)) => {
             let bin = encode_qsb2_response(trace_id, &resp);
             let mut r = Response::new(axum::body::Body::from(bin));
             *r.status_mut() = StatusCode::OK;
@@ -460,9 +558,9 @@ async fn score_dense_f32_bin_v2(State(st): State<AppState>, body: Bytes) -> Resp
             }
             r
         }
-        Err(e) => {
-            error!(error = %e, trace_id = trace_id, "score_dense_f32_bin_v2 failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        Err((status, msg)) => {
+            error!(error = %msg, "score_dense_f32_bin_v2 failed");
+            (status, msg).into_response()
         }
     }
 }
@@ -541,6 +639,7 @@ async fn async_main(
         prom,
         standalone_l2_bench,
         standalone_l2_tau_mode,
+        bench_in_flight: Arc::new(TokioSemaphore::new(args.max_in_flight.max(1))),
     };
 
     let app = Router::new()
@@ -549,7 +648,7 @@ async fn async_main(
         .route("/debug/backend", get(debug_backend))
         .route("/score_dense_f32_bin", post(score_dense_f32_bin))
         .route("/score_dense_f32_bin_v2", post(score_dense_f32_bin_v2))
-        .with_state(st)
+        .with_state(st.clone())
         .layer(
             ServiceBuilder::new()
                 // ✅ 关键：HandleErrorLayer 必须包在最外层，才能把 overload 变成 429
@@ -566,6 +665,16 @@ async fn async_main(
     let addr = SocketAddr::from_str(&args.listen).context("invalid --listen")?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("listening on http://{}", addr);
+
+    if let Some(h2_addr) = args.bench3_h2_listen.as_ref() {
+        let h2_addr = SocketAddr::from_str(h2_addr).context("invalid --bench3-h2-listen")?;
+        let h2_state = st.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_h2_bench_listener(h2_addr, h2_state).await {
+                error!(error = %e, "h2 bench listener failed");
+            }
+        });
+    }
 
     axum::serve(listener, app.into_make_service())
         .await

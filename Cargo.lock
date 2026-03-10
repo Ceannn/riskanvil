@@ -2432,9 +2432,11 @@ name = "risk-bench3"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "crossbeam-channel",
  "crossbeam-queue",
+ "h2",
  "hdrhistogram",
  "http",
  "libc",
@@ -2443,6 +2445,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2538,7 +2541,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "clap",
+ "h2",
  "libc",
  "metrics",
  "metrics-exporter-prometheus",

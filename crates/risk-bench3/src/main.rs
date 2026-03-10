@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use crossbeam_queue::ArrayQueue;
@@ -11,7 +12,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use serde::Serialize;
 use std::cmp::min;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -21,6 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tokio::sync::mpsc as tokio_mpsc;
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const FLUSH_BATCH: usize = 256;
@@ -99,6 +102,12 @@ enum ProtocolMode {
     Rsk1,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+enum TransportKind {
+    Http,
+    H2c,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 enum Verdict {
     Pass,
@@ -120,6 +129,7 @@ struct StageTimingsUs {
 struct Qsb2 {
     decision: u8,
     flags: u8,
+    timings: StageTimingsUs,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -166,6 +176,30 @@ struct ActiveReq {
     deadline: Instant,
     route_header: [u8; 40],
     route_header_len: usize,
+}
+
+#[derive(Clone, Debug)]
+struct H2SendCmd {
+    request_id: u32,
+    body: Bytes,
+}
+
+#[derive(Debug)]
+enum H2RespEvent {
+    Completed {
+        request_id: u32,
+        meta: HttpResponseMeta,
+        body: BodyDecoded,
+    },
+    Failed {
+        request_id: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct H2InflightReq {
+    active: ActiveReq,
+    conn_idx: usize,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -327,11 +361,19 @@ struct RequestTemplate {
 
 impl RequestTemplate {
     fn new(target: &Target, content_len: usize) -> Self {
+        let path_and_query = target
+            .path_and_query
+            .as_ref()
+            .expect("http request template requires path");
+        let host_header = target
+            .host_header
+            .as_ref()
+            .expect("http request template requires host header");
         let mut req = Vec::with_capacity(256);
         req.extend_from_slice(b"POST ");
-        req.extend_from_slice(target.path_and_query.as_bytes());
+        req.extend_from_slice(path_and_query.as_bytes());
         req.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-        req.extend_from_slice(target.host_header.as_bytes());
+        req.extend_from_slice(host_header.as_bytes());
         req.extend_from_slice(
             b"\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\nContent-Length: ",
         );
@@ -345,8 +387,9 @@ impl RequestTemplate {
 
 #[derive(Clone, Debug)]
 struct Target {
-    host_header: String,
-    path_and_query: String,
+    transport: TransportKind,
+    host_header: Option<String>,
+    path_and_query: Option<String>,
     addr: SocketAddr,
 }
 
@@ -355,26 +398,35 @@ fn parse_target(url: &str) -> Result<Target> {
         .parse()
         .with_context(|| format!("invalid --url: {url}"))?;
     let scheme = uri.scheme_str().unwrap_or("http");
-    if scheme != "http" {
-        bail!("only http:// URLs are supported in bench3, got scheme={scheme}");
-    }
+    let transport = match scheme {
+        "http" => TransportKind::Http,
+        "h2c" => TransportKind::H2c,
+        _ => bail!("bench3 supports only http:// and h2c:// URLs, got scheme={scheme}"),
+    };
     let host = uri.host().ok_or_else(|| anyhow!("url missing host"))?;
-    let port = uri.port_u16().unwrap_or(80);
-    let path_and_query = uri
-        .path_and_query()
-        .map(|v| v.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    let host_header = if port == 80 {
+    let port = match transport {
+        TransportKind::Http => uri.port_u16().unwrap_or(80),
+        TransportKind::H2c => uri.port_u16().unwrap_or(8080),
+    };
+    let path_and_query = match transport {
+        TransportKind::Http | TransportKind::H2c => Some(
+            uri.path_and_query()
+                .map(|v| v.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string()),
+        ),
+    };
+    let host_header = Some(if port == 80 {
         host.to_string()
     } else {
         format!("{host}:{port}")
-    };
+    });
     let addr = (host, port)
         .to_socket_addrs()
         .with_context(|| format!("resolve {host}:{port}"))?
         .next()
         .ok_or_else(|| anyhow!("resolve {host}:{port}: no addresses"))?;
     Ok(Target {
+        transport,
         host_header,
         path_and_query,
         addr,
@@ -648,11 +700,14 @@ struct SummaryConfig {
     pacer_cpu: Option<usize>,
     conns_per_worker: usize,
     max_inflight_per_conn: usize,
+    raw_batch_size: usize,
+    stats_sample_rate: usize,
     payload_rows: usize,
     dense_dim: usize,
     route_meta: bool,
     protocol: ProtocolMode,
     transport: &'static str,
+    raw_version: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -755,6 +810,24 @@ fn decode_body(buf: &[u8]) -> io::Result<BodyDecoded> {
         return Ok(BodyDecoded::Qsb2(Qsb2 {
             decision: buf[6],
             flags: buf[7],
+            timings: StageTimingsUs::default(),
+        }));
+    }
+    if buf.len() == 48 && &buf[0..4] == b"QSB2" {
+        let rd = |off: usize| -> u32 {
+            u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+        };
+        return Ok(BodyDecoded::Qsb2(Qsb2 {
+            decision: buf[6],
+            flags: buf[7],
+            timings: StageTimingsUs {
+                parse: rd(24),
+                feature: rd(28),
+                router: rd(32),
+                l1: rd(36),
+                l2: rd(40),
+                serialize: rd(44),
+            },
         }));
     }
     if buf.len() == 48 && &buf[0..4] == b"RSK1" {
@@ -859,8 +932,8 @@ fn pin_current_thread(_cpu: Option<usize>) -> Result<()> {
 }
 
 fn connect_stream(addr: SocketAddr) -> Result<TcpStream> {
-    let std_stream =
-        std::net::TcpStream::connect(addr).with_context(|| format!("connect {addr}"))?;
+    let std_stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50))
+        .with_context(|| format!("connect {addr}"))?;
     std_stream.set_nodelay(true).ok();
     std_stream
         .set_nonblocking(true)
@@ -905,7 +978,19 @@ fn build_completion(
 ) -> CompletedSample {
     let t_send_done = active.t_send_done.unwrap_or(active.t_issue);
     let stage = match body {
-        BodyDecoded::Qsb2(_) => meta.timings_header.unwrap_or_default(),
+        BodyDecoded::Qsb2(q) => {
+            if q.timings.parse > 0
+                || q.timings.feature > 0
+                || q.timings.router > 0
+                || q.timings.l1 > 0
+                || q.timings.l2 > 0
+                || q.timings.serialize > 0
+            {
+                q.timings
+            } else {
+                meta.timings_header.unwrap_or_default()
+            }
+        }
         BodyDecoded::Rsk1(r) => r.timings,
     };
     let (decision, used_l2, qsb2, rsk1) = match body {
@@ -942,6 +1027,402 @@ fn build_timeout(active: &ActiveReq, now: Instant) -> CompletedSample {
         rsk1: false,
         stage: StageTimingsUs::default(),
     }
+}
+
+fn build_payload_bytes(
+    corpus: &PayloadCorpus,
+    route_meta: Option<&RouteMetaCorpus>,
+    row_idx: usize,
+) -> Bytes {
+    if let Some(route_meta) = route_meta {
+        let mut out = Vec::with_capacity(40 + corpus.row_bytes);
+        out.extend_from_slice(&encode_rvec_v3_route_header(
+            route_meta.row(row_idx),
+            corpus.row_bytes / 4,
+        ));
+        out.extend_from_slice(corpus.row_slice(row_idx));
+        Bytes::from(out)
+    } else {
+        Bytes::copy_from_slice(corpus.row_slice(row_idx))
+    }
+}
+
+async fn connect_h2_stream(addr: SocketAddr) -> Result<tokio::net::TcpStream> {
+    let stream = tokio::time::timeout(
+        Duration::from_millis(200),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .with_context(|| format!("connect timeout {addr}"))?
+    .with_context(|| format!("connect {addr}"))?;
+    stream.set_nodelay(true).ok();
+    Ok(stream)
+}
+
+async fn decode_h2_response(
+    response: h2::client::ResponseFuture,
+) -> Result<(HttpResponseMeta, BodyDecoded)> {
+    let response = response.await.context("await h2 response")?;
+    let status_code = response.status().as_u16();
+    let timings_header = response
+        .headers()
+        .get("x-risk-timings-us")
+        .and_then(|v| v.to_str().ok())
+        .and_then(decode_timings_csv);
+    let mut body_stream = response.into_body();
+    let mut body = bytes::BytesMut::with_capacity(128);
+    while let Some(chunk) = body_stream.data().await {
+        let chunk = chunk.context("read h2 response body")?;
+        body.extend_from_slice(&chunk);
+        let _ = body_stream.flow_control().release_capacity(chunk.len());
+    }
+    let decoded = decode_body(&body).context("decode h2 response body")?;
+    Ok((
+        HttpResponseMeta {
+            status_code,
+            timings_header,
+        },
+        decoded,
+    ))
+}
+
+async fn drive_h2_connection(
+    addr: SocketAddr,
+    uri: Arc<str>,
+    mut cmd_rx: tokio_mpsc::UnboundedReceiver<H2SendCmd>,
+    resp_tx: tokio_mpsc::UnboundedSender<H2RespEvent>,
+) -> Result<()> {
+    let mut pending: Option<H2SendCmd> = None;
+    loop {
+        let cmd = match pending.take() {
+            Some(cmd) => cmd,
+            None => match cmd_rx.recv().await {
+                Some(cmd) => cmd,
+                None => return Ok(()),
+            },
+        };
+
+        let stream = match connect_h2_stream(addr).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                let _ = resp_tx.send(H2RespEvent::Failed {
+                    request_id: cmd.request_id,
+                });
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+
+        let (sender, conn) = match h2::client::handshake(stream).await {
+            Ok(parts) => parts,
+            Err(_) => {
+                let _ = resp_tx.send(H2RespEvent::Failed {
+                    request_id: cmd.request_id,
+                });
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        pending = Some(cmd);
+
+        loop {
+            let cmd = match pending.take() {
+                Some(cmd) => cmd,
+                None => match cmd_rx.recv().await {
+                    Some(cmd) => cmd,
+                    None => return Ok(()),
+                },
+            };
+
+            let request = http::Request::builder()
+                .method("POST")
+                .uri(uri.as_ref())
+                .header("content-type", "application/octet-stream")
+                .body(())
+                .context("build h2 request")?;
+            let request_id = cmd.request_id;
+            let mut ready = match sender.clone().ready().await {
+                Ok(ready) => ready,
+                Err(_) => {
+                    let _ = resp_tx.send(H2RespEvent::Failed { request_id });
+                    break;
+                }
+            };
+            match ready.send_request(request, false) {
+                Ok((response, mut send_stream)) => {
+                    if send_stream.send_data(cmd.body, true).is_err() {
+                        let _ = resp_tx.send(H2RespEvent::Failed { request_id });
+                        break;
+                    }
+                    let resp_tx2 = resp_tx.clone();
+                    tokio::spawn(async move {
+                        let event = match decode_h2_response(response).await {
+                            Ok((meta, body)) => H2RespEvent::Completed {
+                                request_id,
+                                meta,
+                                body,
+                            },
+                            Err(_) => H2RespEvent::Failed { request_id },
+                        };
+                        let _ = resp_tx2.send(event);
+                    });
+                }
+                Err(_) => {
+                    let _ = resp_tx.send(H2RespEvent::Failed { request_id });
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn worker_loop_h2c_async(
+    worker_id: usize,
+    args: Args,
+    target: Target,
+    corpus: PayloadCorpus,
+    route_meta: Option<RouteMetaCorpus>,
+    queue: Arc<ArrayQueue<ReqToken>>,
+    events_tx: Sender<AggEvent>,
+    pacer_done: Arc<AtomicBool>,
+) -> Result<()> {
+    let timeout = Duration::from_millis(args.timeout_ms.max(1));
+    let uri = Arc::<str>::from(format!(
+        "http://{}{}",
+        target
+            .host_header
+            .as_ref()
+            .expect("h2c target requires host header"),
+        target
+            .path_and_query
+            .as_ref()
+            .expect("h2c target requires path"),
+    ));
+    let (resp_tx, mut resp_rx) = tokio_mpsc::unbounded_channel::<H2RespEvent>();
+    let mut cmd_txs = Vec::with_capacity(args.conns_per_worker);
+    for _ in 0..args.conns_per_worker.max(1) {
+        let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<H2SendCmd>();
+        cmd_txs.push(cmd_tx);
+        let resp_tx2 = resp_tx.clone();
+        let addr = target.addr;
+        let uri2 = uri.clone();
+        tokio::spawn(async move {
+            let _ = drive_h2_connection(addr, uri2, cmd_rx, resp_tx2).await;
+        });
+    }
+    drop(resp_tx);
+
+    let mut inflight = HashMap::<u32, H2InflightReq>::with_capacity(
+        args.conns_per_worker
+            .saturating_mul(args.max_inflight_per_conn.max(1)),
+    );
+    let mut inflight_counts = vec![0usize; args.conns_per_worker.max(1)];
+    let local_pending_cap = args
+        .conns_per_worker
+        .saturating_mul(args.max_inflight_per_conn.max(1))
+        .saturating_mul(2)
+        .max(1);
+    let mut local_pending: VecDeque<QueuedReq> = VecDeque::with_capacity(local_pending_cap);
+    let mut next_conn_rr = worker_id % args.conns_per_worker.max(1);
+    let mut next_request_id = ((worker_id as u32) << 20).wrapping_add(1);
+    let mut batch = Vec::with_capacity(FLUSH_BATCH);
+    let mut last_flush = Instant::now();
+    let mut drain_started: Option<Instant> = None;
+
+    loop {
+        while local_pending.len() < local_pending_cap {
+            let Some(tok) = queue.pop() else {
+                break;
+            };
+            local_pending.push_back(QueuedReq {
+                row_idx: tok.row_idx,
+                t_sched: tok.t_sched,
+                t_issue: Instant::now(),
+                record: tok.record,
+            });
+        }
+
+        while let Ok(event) = resp_rx.try_recv() {
+            match event {
+                H2RespEvent::Completed {
+                    request_id,
+                    meta,
+                    body,
+                } => {
+                    if let Some(req) = inflight.remove(&request_id) {
+                        inflight_counts[req.conn_idx] =
+                            inflight_counts[req.conn_idx].saturating_sub(1);
+                        if req.active.record {
+                            batch.push(build_completion(&req.active, Instant::now(), meta, body));
+                        }
+                    }
+                }
+                H2RespEvent::Failed { request_id } => {
+                    if let Some(req) = inflight.remove(&request_id) {
+                        inflight_counts[req.conn_idx] =
+                            inflight_counts[req.conn_idx].saturating_sub(1);
+                        if req.active.record {
+                            batch.push(build_timeout(&req.active, Instant::now()));
+                        }
+                    }
+                }
+            }
+        }
+
+        while let Some(req) = local_pending.pop_front() {
+            let mut selected = None;
+            for step in 0..cmd_txs.len() {
+                let idx = (next_conn_rr + step) % cmd_txs.len();
+                if inflight_counts[idx] < args.max_inflight_per_conn.max(1) {
+                    selected = Some(idx);
+                    next_conn_rr = (idx + 1) % cmd_txs.len();
+                    break;
+                }
+            }
+            let Some(conn_idx) = selected else {
+                local_pending.push_front(req);
+                break;
+            };
+
+            let now = Instant::now();
+            let body = build_payload_bytes(&corpus, route_meta.as_ref(), req.row_idx);
+            let active = ActiveReq {
+                row_idx: req.row_idx,
+                t_sched: req.t_sched,
+                t_issue: req.t_issue,
+                record: req.record,
+                t_send_done: Some(now),
+                deadline: now + timeout,
+                route_header: [0u8; 40],
+                route_header_len: 0,
+            };
+            let request_id = next_request_id;
+            next_request_id = next_request_id.wrapping_add(1);
+            if cmd_txs[conn_idx]
+                .send(H2SendCmd {
+                    request_id,
+                    body,
+                })
+                .is_err()
+            {
+                if active.record {
+                    batch.push(build_timeout(&active, Instant::now()));
+                }
+                continue;
+            }
+            inflight.insert(
+                request_id,
+                H2InflightReq { active, conn_idx },
+            );
+            inflight_counts[conn_idx] += 1;
+        }
+
+        let now = Instant::now();
+        let expired: Vec<u32> = inflight
+            .iter()
+            .filter_map(|(request_id, req)| (now >= req.active.deadline).then_some(*request_id))
+            .collect();
+        for request_id in expired {
+            if let Some(req) = inflight.remove(&request_id) {
+                inflight_counts[req.conn_idx] = inflight_counts[req.conn_idx].saturating_sub(1);
+                if req.active.record {
+                    batch.push(build_timeout(&req.active, now));
+                }
+            }
+        }
+
+        if batch.len() >= FLUSH_BATCH || last_flush.elapsed() >= Duration::from_millis(2) {
+            maybe_flush_batch(&events_tx, &mut batch);
+            last_flush = Instant::now();
+        }
+
+        let all_idle = queue.is_empty() && local_pending.is_empty() && inflight.is_empty();
+        if pacer_done.load(Ordering::Acquire) && all_idle {
+            break;
+        }
+
+        if pacer_done.load(Ordering::Acquire) && queue.is_empty() && local_pending.is_empty() {
+            let started = drain_started.get_or_insert_with(Instant::now);
+            if started.elapsed() >= timeout + Duration::from_millis(100) {
+                let now = Instant::now();
+                for (_, req) in inflight.drain() {
+                    inflight_counts[req.conn_idx] = inflight_counts[req.conn_idx].saturating_sub(1);
+                    if req.active.record {
+                        batch.push(build_timeout(&req.active, now));
+                    }
+                }
+                break;
+            }
+        } else {
+            drain_started = None;
+        }
+
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(1), resp_rx.recv()).await
+        {
+            match event {
+                H2RespEvent::Completed {
+                    request_id,
+                    meta,
+                    body,
+                } => {
+                    if let Some(req) = inflight.remove(&request_id) {
+                        inflight_counts[req.conn_idx] =
+                            inflight_counts[req.conn_idx].saturating_sub(1);
+                        if req.active.record {
+                            batch.push(build_completion(&req.active, Instant::now(), meta, body));
+                        }
+                    }
+                }
+                H2RespEvent::Failed { request_id } => {
+                    if let Some(req) = inflight.remove(&request_id) {
+                        inflight_counts[req.conn_idx] =
+                            inflight_counts[req.conn_idx].saturating_sub(1);
+                        if req.active.record {
+                            batch.push(build_timeout(&req.active, Instant::now()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    maybe_flush_batch(&events_tx, &mut batch);
+    Ok(())
+}
+
+fn worker_loop_h2c(
+    worker_id: usize,
+    cpu: Option<usize>,
+    args: Args,
+    target: Target,
+    corpus: PayloadCorpus,
+    route_meta: Option<RouteMetaCorpus>,
+    queue: Arc<ArrayQueue<ReqToken>>,
+    events_tx: Sender<AggEvent>,
+    pacer_done: Arc<AtomicBool>,
+) -> Result<()> {
+    pin_current_thread(cpu)?;
+    if args.progress {
+        eprintln!("[bench3] worker={} start cpu={:?} transport=h2c", worker_id, cpu);
+    }
+    let rt = TokioRuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build worker h2 runtime")?;
+    rt.block_on(worker_loop_h2c_async(
+        worker_id,
+        args,
+        target,
+        corpus,
+        route_meta,
+        queue,
+        events_tx,
+        pacer_done,
+    ))
 }
 
 fn encode_rvec_v3_route_header(meta: RouteMetaEntry, dim: usize) -> [u8; 40] {
@@ -1073,7 +1554,7 @@ fn reconnect_conn(conn: &mut Conn, poll: &Poll, target: &Target) -> Result<()> {
     Ok(())
 }
 
-fn worker_loop(
+fn worker_loop_http(
     worker_id: usize,
     cpu: Option<usize>,
     args: Args,
@@ -1554,14 +2035,20 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let req_tpl = RequestTemplate::new(
-        &target,
-        corpus.row_bytes + route_meta.as_ref().map(|_| 40).unwrap_or(0),
-    );
+    let req_tpl = if target.transport == TransportKind::Http {
+        Some(RequestTemplate::new(
+            &target,
+            corpus.row_bytes + route_meta.as_ref().map(|_| 40).unwrap_or(0),
+        ))
+    } else {
+        None
+    };
+    let target_transport = target.transport;
 
     eprintln!(
-        "[bench3] url={} rps={} warmup={}s duration={}s workers={} conns_per_worker={} max_inflight_per_conn={} payload_rows={} dim={} route_meta={} protocol={:?}",
+        "[bench3] url={} transport={:?} rps={} warmup={}s duration={}s workers={} conns_per_worker={} max_inflight_per_conn={} payload_rows={} dim={} route_meta={} protocol={:?}",
         args.url,
+        target.transport,
         args.rps,
         args.warmup,
         args.duration,
@@ -1574,9 +2061,15 @@ fn main() -> Result<()> {
         args.protocol
     );
 
+    let queue_depth_scale = match target_transport {
+        TransportKind::Http => 1,
+        TransportKind::H2c => 8,
+    };
     let per_worker_cap = args
         .conns_per_worker
-        .saturating_mul(args.max_inflight_per_conn.max(1));
+        .saturating_mul(args.max_inflight_per_conn.max(1))
+        .saturating_mul(queue_depth_scale)
+        .max(1);
     let (events_tx, events_rx) = crossbeam_channel::unbounded::<AggEvent>();
     let pacer_done = Arc::new(AtomicBool::new(false));
     let mut worker_queues = Vec::with_capacity(workers);
@@ -1599,18 +2092,31 @@ fn main() -> Result<()> {
         let h = thread::Builder::new()
             .name(name)
             .spawn(move || {
-                let res = worker_loop(
-                    worker_id,
-                    cpu,
-                    args2,
-                    target2,
-                    corpus2,
-                    route_meta2,
-                    req_tpl2,
-                    queue,
-                    tx2.clone(),
-                    done2,
-                );
+                let res = match target2.transport {
+                    TransportKind::Http => worker_loop_http(
+                        worker_id,
+                        cpu,
+                        args2,
+                        target2,
+                        corpus2,
+                        route_meta2,
+                        req_tpl2.expect("http worker requires request template"),
+                        queue,
+                        tx2.clone(),
+                        done2,
+                    ),
+                    TransportKind::H2c => worker_loop_h2c(
+                        worker_id,
+                        cpu,
+                        args2,
+                        target2,
+                        corpus2,
+                        route_meta2,
+                        queue,
+                        tx2.clone(),
+                        done2,
+                    ),
+                };
                 let _ = tx2.send(AggEvent::WorkerDone);
                 if let Err(ref e) = res {
                     eprintln!("[bench3] worker {worker_id} failed: {e:#}");
@@ -1628,13 +2134,7 @@ fn main() -> Result<()> {
     let pacer_handle = thread::Builder::new()
         .name("bench3-pacer".to_string())
         .spawn(move || {
-            let res = pacer_loop(
-                pacer_args,
-                worker_queues,
-                corpus.rows,
-                tx2,
-                pacer_done2.clone(),
-            );
+            let res = pacer_loop(pacer_args, worker_queues, corpus.rows, tx2, pacer_done2.clone());
             pacer_done2.store(true, Ordering::Release);
             if let Err(ref e) = res {
                 eprintln!("[bench3] pacer failed: {e:#}");
@@ -1681,7 +2181,7 @@ fn main() -> Result<()> {
         e2e_q.p50, e2e_q.p95, e2e_q.p99
     );
     println!(
-        "[bench3] http: 2xx={} 429={} 5xx={} timeout={} drop_inflight_cap={} drop_conn_queue_full={}",
+        "[bench3] status: 2xx={} 429={} 5xx={} timeout={} drop_inflight_cap={} drop_conn_queue_full={}",
         total.http_2xx, total.http_429, total.http_5xx, total.timeout, total.drop_inflight_cap, total.drop_conn_queue_full
     );
     println!(
@@ -1723,11 +2223,17 @@ fn main() -> Result<()> {
                 pacer_cpu: args.pacer_cpu,
                 conns_per_worker: args.conns_per_worker,
                 max_inflight_per_conn: args.max_inflight_per_conn,
+                raw_batch_size: 0,
+                stats_sample_rate: 0,
                 payload_rows: corpus.rows,
                 dense_dim: args.dense_dim,
                 route_meta: route_meta.is_some(),
                 protocol: args.protocol,
-                transport: "http1_keepalive_manual",
+                transport: match target_transport {
+                    TransportKind::Http => "http1_keepalive_manual",
+                    TransportKind::H2c => "h2c_http2",
+                },
+                raw_version: None,
             },
             counts: SummaryCounts {
                 attempted: total.attempted,

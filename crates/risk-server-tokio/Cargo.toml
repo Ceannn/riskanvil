@@ -7,6 +7,8 @@ edition = "2021"
 risk-core = { path = "../risk-core", default-features = false }
 risk-quickscorer-standalone-l2 = { path = "../risk-quickscorer-standalone-l2" }
 axum = "0.7"
+bytes = "1"
+h2 = "0.4"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

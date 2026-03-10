@@ -9,7 +9,11 @@ use std::io::Write as _;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use risk_core::{
-    config::Config, pipeline::{AppCore, StandaloneL2TauMode}, quickscorer::QuickRouteMeta, schema::Decision, util::now_us,
+    config::Config,
+    pipeline::{AppCore, StandaloneL2TauMode},
+    quickscorer::QuickRouteMeta,
+    schema::{Decision, ScoreResponse},
+    util::now_us,
 };
 use risk_quickscorer_standalone_l2::StandaloneL2Runtime;
 
@@ -330,22 +334,22 @@ fn main() -> anyhow::Result<()> {
                     Some(Path::new(path)),
                 )?)
             } else {
-                Arc::new(StandaloneL2Runtime::load(
-                    Path::new(args.bundle_dir.as_deref().unwrap_or_default()),
-                )?)
+                Arc::new(StandaloneL2Runtime::load(Path::new(
+                    args.bundle_dir.as_deref().unwrap_or_default(),
+                ))?)
             })
         } else {
             None
         },
         standalone_l2_tau_mode: if args.l2_bench_mode.as_deref() == Some("standalone-sidecar") {
             Some(match args.l2_bench_tau_mode.as_str() {
-                "fixed" => StandaloneL2TauMode::Fixed(
-                    args.l2_bench_fixed_tau.ok_or_else(|| {
+                "fixed" => {
+                    StandaloneL2TauMode::Fixed(args.l2_bench_fixed_tau.ok_or_else(|| {
                         anyhow::anyhow!(
                             "--l2-bench-fixed-tau is required when --l2-bench-tau-mode=fixed"
                         )
-                    })?,
-                ),
+                    })?)
+                }
                 _ => StandaloneL2TauMode::Request,
             })
         } else {
@@ -408,13 +412,8 @@ fn main() -> anyhow::Result<()> {
             // ENOMEM warnings under multi-shard startup.
             .io_memory(GLOMMIO_IO_MEMORY_BYTES)
             .spawn(move || async move {
-                run_accept_loop(
-                    addr2,
-                    st,
-                    Rc::new(Semaphore::new(per_core_in_flight2)),
-                    true,
-                )
-                .await
+                let sem = Rc::new(Semaphore::new(per_core_in_flight2));
+                run_accept_loop(addr2, st, sem, true).await
             })
             .unwrap();
         handles.push(h);
@@ -431,14 +430,9 @@ fn main() -> anyhow::Result<()> {
                 // default memlock budget on WSL/Linux.
                 .io_memory(GLOMMIO_IO_MEMORY_BYTES)
                 .spawn(move || async move {
+                    let sem = Rc::new(Semaphore::new(per_core_in_flight2));
                     // glommio::net::TcpListener::bind() 会设置 SO_REUSEPORT，允许多 executor 同地址并行 accept。
-                    run_accept_loop(
-                        addr2,
-                        st,
-                        Rc::new(Semaphore::new(per_core_in_flight2)),
-                        idx == 0,
-                    )
-                    .await
+                    run_accept_loop(addr2, st, sem, idx == 0).await
                 })
                 .unwrap();
             handles.push(h);
@@ -1287,6 +1281,52 @@ fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<DenseRequ
         }
         _ => Err(format!("unsupported RVEC version: {}", ver)),
     }
+}
+
+async fn score_dense_binary_request(
+    st: &AppState,
+    core_sem: &Semaphore,
+    body: Bytes,
+) -> Result<(u64, ScoreResponse), String> {
+    let (_g, _p) = match try_acquire_inflight(st, core_sem) {
+        Some(g) => g,
+        None => return Err("overloaded".into()),
+    };
+
+    let (dim, _) = st
+        .core
+        .quick_dims()
+        .ok_or_else(|| "quickscorer not enabled".to_string())?;
+    let t_parse = std::time::Instant::now();
+    let req = parse_dense_payload_le(&body, dim)?;
+    let parse_us = now_us(t_parse);
+    let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let sidecar_row_idx = req
+        .route_meta
+        .as_ref()
+        .map(|m| m.row_idx as usize)
+        .unwrap_or(trace_id as usize);
+    let resp = if let (Some(rt), Some(tau_mode)) =
+        (st.standalone_l2_bench.as_ref(), st.standalone_l2_tau_mode)
+    {
+        st.core
+            .score_quick_dense_bytes_with_standalone_bench_l2_async(
+                parse_us,
+                req.payload,
+                req.route_meta,
+                rt,
+                sidecar_row_idx,
+                tau_mode,
+            )
+            .await
+    } else {
+        st.core
+            .score_quick_dense_bytes_with_meta_async(parse_us, req.payload, req.route_meta)
+            .await
+    }
+    .map_err(|e| format!("quickscorer inference failed: {:#}", e))?;
+
+    Ok((trace_id, resp))
 }
 
 /// Encode 48-byte RSK1 response.

@@ -365,6 +365,40 @@ struct HotCompiledPrefixPack {
     nodes: Vec<HotCompiledPrefixNode>,
 }
 
+const LATE_IF_TREE_NODE_LEAF: u8 = 1 << 7;
+const LATE_IF_TREE_NODE_FIDX_MASK: u8 = LATE_IF_TREE_NODE_LEAF - 1;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct LateIfTreeNode {
+    thr: f32,
+    leaf: f32,
+    left: u8,
+    right: u8,
+    fidx_flags: u8,
+    _pad: u8,
+}
+
+impl LateIfTreeNode {
+    #[inline(always)]
+    fn is_leaf(self) -> bool {
+        (self.fidx_flags & LATE_IF_TREE_NODE_LEAF) != 0
+    }
+
+    #[inline(always)]
+    fn fidx(self) -> usize {
+        (self.fidx_flags & LATE_IF_TREE_NODE_FIDX_MASK) as usize
+    }
+}
+
+#[derive(Debug)]
+struct LateIfTreeProgram {
+    start_tree_idx: usize,
+    n_trees: usize,
+    tree_node_offs: Vec<u32>,
+    nodes: Vec<LateIfTreeNode>,
+}
+
 #[derive(Debug)]
 struct RouteMeta {
     n_rows: usize,
@@ -765,6 +799,7 @@ fn parse_prefix_v4_mode(raw: &str) -> Result<PrefixV4Mode> {
 #[derive(Debug)]
 struct LoadedPrefixRuntime {
     pack: qs_exact::QsPack,
+    late_iftree_program: Option<LateIfTreeProgram>,
     calibration: LoadedPrefixCal,
     atlas_certifier: Option<LoadedPrefixAtlas>,
     mlp_certifier: Option<LoadedMlpCertifier>,
@@ -1506,6 +1541,104 @@ fn compile_hot_prefix_pack(pack: &PrefixPack) -> Result<HotCompiledPrefixPack> {
         n_trees: pack.n_trees,
         hot_global_fidx: pack.hot_global_fidx.clone(),
         tree_roots: pack.tree_roots.iter().map(|&v| v as u16).collect(),
+        nodes,
+    })
+}
+
+fn compile_late_if_tree_program(
+    model: &SoaModel,
+    plan: &TreeOrder,
+    start_tree_idx: usize,
+    checkpoints: &[usize],
+) -> Result<LateIfTreeProgram> {
+    if checkpoints.is_empty() {
+        bail!("late if-tree checkpoints must not be empty");
+    }
+    let end_tree_idx = *checkpoints.last().unwrap_or(&start_tree_idx);
+    if start_tree_idx > end_tree_idx || end_tree_idx > plan.n_trees {
+        bail!(
+            "invalid late if-tree range [{}..{}) for plan.n_trees={}",
+            start_tree_idx,
+            end_tree_idx,
+            plan.n_trees
+        );
+    }
+    if model.n_features > LATE_IF_TREE_NODE_FIDX_MASK as usize {
+        bail!(
+            "late if-tree program requires n_features <= {} got {}",
+            LATE_IF_TREE_NODE_FIDX_MASK,
+            model.n_features
+        );
+    }
+
+    let mut tree_node_offs = Vec::with_capacity(end_tree_idx.saturating_sub(start_tree_idx));
+    let mut nodes = Vec::new();
+    for pos in start_tree_idx..end_tree_idx {
+        let tree_idx = *plan.order.get(pos).unwrap_or(&0) as usize;
+        let src_start = *model.tree_roots.get(tree_idx).unwrap_or(&0) as usize;
+        let src_end = if tree_idx + 1 < model.n_trees {
+            *model
+                .tree_roots
+                .get(tree_idx + 1)
+                .unwrap_or(&(model.node_count as u32)) as usize
+        } else {
+            model.node_count
+        };
+        if src_end < src_start || src_end > model.node_count {
+            bail!(
+                "invalid source node range [{}..{}) for tree_idx={} node_count={}",
+                src_start,
+                src_end,
+                tree_idx,
+                model.node_count
+            );
+        }
+        let local_node_count = src_end - src_start;
+        if local_node_count > u8::MAX as usize {
+            bail!(
+                "late if-tree local node count {} exceeds compact limit for tree_idx={}",
+                local_node_count,
+                tree_idx
+            );
+        }
+        let dst_base = nodes.len() as u32;
+        tree_node_offs.push(dst_base);
+        for src_idx in src_start..src_end {
+            let is_leaf = *model.is_leaf.get(src_idx).unwrap_or(&0) != 0;
+            let fidx_flags = if is_leaf {
+                LATE_IF_TREE_NODE_LEAF
+            } else {
+                let fidx = *model.fidx.get(src_idx).unwrap_or(&0);
+                if fidx < 0 {
+                    bail!("negative fidx in non-leaf late node: {}", fidx);
+                }
+                fidx as u8
+            };
+            let left = if is_leaf {
+                0
+            } else {
+                (*model.left.get(src_idx).unwrap_or(&0) as usize - src_start) as u8
+            };
+            let right = if is_leaf {
+                0
+            } else {
+                (*model.right.get(src_idx).unwrap_or(&0) as usize - src_start) as u8
+            };
+            nodes.push(LateIfTreeNode {
+                thr: *model.thr.get(src_idx).unwrap_or(&0.0),
+                leaf: *model.leaf.get(src_idx).unwrap_or(&0.0),
+                left,
+                right,
+                fidx_flags,
+                _pad: 0,
+            });
+        }
+    }
+
+    Ok(LateIfTreeProgram {
+        start_tree_idx,
+        n_trees: end_tree_idx.saturating_sub(start_tree_idx),
+        tree_node_offs,
         nodes,
     })
 }
@@ -2376,8 +2509,26 @@ fn load_prefix_runtime(
     }
     let hot_checkpoint_layout =
         build_hot_checkpoint_layout(&calibration, hot_pack.as_ref(), &pack, resolved.direct_kernel);
+    let late_iftree_program = if let (Some(compiled_hot_pack), Some(layout)) =
+        (compiled_hot_pack.as_ref(), hot_checkpoint_layout.as_ref())
+    {
+        if layout.late_values.is_empty() {
+            None
+        } else {
+            let hot_limit = compiled_hot_pack.n_trees.min(plan.n_trees);
+            Some(compile_late_if_tree_program(
+                model,
+                &plan,
+                hot_limit,
+                &layout.late_values,
+            )?)
+        }
+    } else {
+        None
+    };
     Ok(LoadedPrefixRuntime {
         pack,
+        late_iftree_program,
         calibration,
         atlas_certifier,
         mlp_certifier,
@@ -4289,24 +4440,68 @@ fn run_prefix_shadow_row_single_route_compiled(
         trees_used = hot_trees_used;
     }
     if direct_decision.get().is_none() && !hot_checkpoint_layout.late_values.is_empty() {
-        let hot_limit = compiled_hot_pack.n_trees.min(runtime.pack.n_trees());
         let mut late_pos = 0usize;
-        let late_row = qs_exact::prefix_until_from(
-            &runtime.pack,
-            feat,
-            ranks,
-            missing,
-            &hot_checkpoint_layout.late_values,
-            hot_limit,
-            score,
-            work_evals,
-            resolved_early,
-            |checkpoint, prefix_score, qs_work, resolved| {
-                let global_cp_idx = hot_checkpoint_layout.late_indices[late_pos];
-                late_pos += 1;
-                handle_checkpoint(global_cp_idx, checkpoint, prefix_score, qs_work, resolved)
-            },
-        )?;
+        let late_row = if nan_free {
+            if let Some(prog) = runtime.late_iftree_program.as_ref() {
+                unsafe {
+                    late_iftree_prefix_until_nomiss(
+                        prog,
+                        feat,
+                        &hot_checkpoint_layout.late_values,
+                        score,
+                        work_evals,
+                        resolved_early,
+                        |checkpoint, prefix_score, qs_work, resolved| {
+                            let global_cp_idx = hot_checkpoint_layout.late_indices[late_pos];
+                            late_pos += 1;
+                            handle_checkpoint(
+                                global_cp_idx,
+                                checkpoint,
+                                prefix_score,
+                                qs_work,
+                                resolved,
+                            )
+                        },
+                    )
+                }?
+            } else {
+                let hot_limit = compiled_hot_pack.n_trees.min(runtime.pack.n_trees());
+                qs_exact::prefix_until_from(
+                    &runtime.pack,
+                    feat,
+                    ranks,
+                    missing,
+                    &hot_checkpoint_layout.late_values,
+                    hot_limit,
+                    score,
+                    work_evals,
+                    resolved_early,
+                    |checkpoint, prefix_score, qs_work, resolved| {
+                        let global_cp_idx = hot_checkpoint_layout.late_indices[late_pos];
+                        late_pos += 1;
+                        handle_checkpoint(global_cp_idx, checkpoint, prefix_score, qs_work, resolved)
+                    },
+                )?
+            }
+        } else {
+            let hot_limit = compiled_hot_pack.n_trees.min(runtime.pack.n_trees());
+            qs_exact::prefix_until_from(
+                &runtime.pack,
+                feat,
+                ranks,
+                missing,
+                &hot_checkpoint_layout.late_values,
+                hot_limit,
+                score,
+                work_evals,
+                resolved_early,
+                |checkpoint, prefix_score, qs_work, resolved| {
+                    let global_cp_idx = hot_checkpoint_layout.late_indices[late_pos];
+                    late_pos += 1;
+                    handle_checkpoint(global_cp_idx, checkpoint, prefix_score, qs_work, resolved)
+                },
+            )?
+        };
         score = late_row.prefix_score;
         work_evals = late_row.block_evals;
         resolved_early = late_row.resolved_early_trees;
@@ -4367,6 +4562,71 @@ fn rescue_route_code(action: RescueAction) -> u8 {
         RescueAction::RejectRescue => 2,
         RescueAction::ReferRescue => 3,
     }
+}
+
+unsafe fn late_iftree_prefix_until_nomiss<F>(
+    prog: &LateIfTreeProgram,
+    feat: &[f32],
+    checkpoints: &[usize],
+    init_score: f32,
+    init_node_evals: u64,
+    init_resolved_early_trees: u64,
+    mut on_checkpoint: F,
+) -> Result<qs_exact::QsPrefixDecisionRow>
+where
+    F: FnMut(usize, f32, u64, u64) -> bool,
+{
+    if checkpoints.is_empty() {
+        bail!("late if-tree checkpoints must not be empty");
+    }
+    debug_assert!(checkpoints[0] > prog.start_tree_idx);
+    debug_assert!(checkpoints[checkpoints.len() - 1] <= prog.start_tree_idx + prog.n_trees);
+
+    let mut score = init_score;
+    let mut node_evals = init_node_evals;
+    let resolved_early = init_resolved_early_trees;
+    let mut next_checkpoint_idx = 0usize;
+
+    for pos in 0..prog.n_trees {
+        let base = *prog.tree_node_offs.get_unchecked(pos) as usize;
+        let mut idx = 0usize;
+        loop {
+            let node = *prog.nodes.get_unchecked(base + idx);
+            if node.is_leaf() {
+                score += node.leaf;
+                break;
+            }
+            let x = *feat.get_unchecked(node.fidx());
+            node_evals += 1;
+            idx = if x < node.thr {
+                node.left as usize
+            } else {
+                node.right as usize
+            };
+        }
+        let completed_trees = prog.start_tree_idx + pos + 1;
+        if completed_trees == checkpoints[next_checkpoint_idx] {
+            if on_checkpoint(completed_trees, score, node_evals, resolved_early) {
+                return Ok(qs_exact::QsPrefixDecisionRow {
+                    prefix_score: score,
+                    trees_used: completed_trees,
+                    block_evals: node_evals,
+                    resolved_early_trees: resolved_early,
+                });
+            }
+            next_checkpoint_idx += 1;
+            if next_checkpoint_idx >= checkpoints.len() {
+                return Ok(qs_exact::QsPrefixDecisionRow {
+                    prefix_score: score,
+                    trees_used: completed_trees,
+                    block_evals: node_evals,
+                    resolved_early_trees: resolved_early,
+                });
+            }
+        }
+    }
+
+    bail!("failed to reach final late if-tree checkpoint");
 }
 
 fn run_anchor_rescue_shadow_row(
@@ -9999,9 +10259,12 @@ impl StandaloneL2Runtime {
             resolved.feat_bin = path.to_path_buf();
         }
         let batch = load_features(&resolved.feat_bin)?;
+        let route_meta = load_route_meta(&resolved.route_meta)?;
         let model = load_soa(&resolved.soa)?;
         let bounds = load_bounds(&resolved.bounds)?;
-        let runtime = load_prefix_runtime(&resolved, &model, &bounds)?;
+        let mut runtime = load_prefix_runtime(&resolved, &model, &bounds)?;
+        let sample_rows = batch.n_rows.min(route_meta.n_rows);
+        maybe_apply_sampled_late_block_reorder(&mut runtime, &batch, &route_meta, sample_rows)?;
         Ok(Self {
             runtime,
             model,
@@ -10084,6 +10347,66 @@ impl StandaloneL2Runtime {
         );
         self.predict_l2_row_nomiss_with_scratch(self.batch.row(row_idx), tau, fold_id, scratch)
     }
+}
+
+fn maybe_apply_sampled_late_block_reorder(
+    runtime: &mut LoadedPrefixRuntime,
+    batch: &FeatureBatch,
+    route_meta: &RouteMeta,
+    n: usize,
+) -> Result<()> {
+    if !batch.nan_free {
+        return Ok(());
+    }
+    let Some(compiled_hot_pack) = runtime.compiled_hot_pack.as_ref() else {
+        return Ok(());
+    };
+    let Some(hot_checkpoint_layout) = runtime.hot_checkpoint_layout.as_ref() else {
+        return Ok(());
+    };
+    if hot_checkpoint_layout.late_values.is_empty() {
+        return Ok(());
+    }
+
+    let hot_limit = compiled_hot_pack.n_trees.min(runtime.pack.n_trees());
+    let late_end = *hot_checkpoint_layout.late_values.last().unwrap_or(&hot_limit);
+    if hot_limit >= late_end {
+        return Ok(());
+    }
+
+    let sample_cap = 256usize;
+    let mut sample_ranks = Vec::with_capacity(sample_cap);
+    let mut missing = vec![0u8; runtime.pack.n_features()];
+    let mut active_rows = Vec::new();
+    for row_idx in 0..n.min(batch.n_rows).min(route_meta.n_rows) {
+        if route_meta.active[row_idx] != 0 {
+            active_rows.push(row_idx);
+        }
+    }
+    if active_rows.is_empty() {
+        return Ok(());
+    }
+
+    let sample_n = sample_cap.min(active_rows.len());
+    for sample_idx in 0..sample_n {
+        let row_idx = active_rows[sample_idx * active_rows.len() / sample_n];
+        let feat = batch.row(row_idx);
+        let mut ranks = vec![0u8; runtime.pack.n_features()];
+        qs_exact::quantize_into(&runtime.pack, feat, &mut ranks, &mut missing);
+        sample_ranks.push(ranks);
+    }
+
+    if sample_ranks.is_empty() {
+        return Ok(());
+    }
+
+    qs_exact::reorder_front_blocks_sampled_nomiss(
+        &mut runtime.pack,
+        &sample_ranks,
+        hot_limit,
+        late_end,
+        16,
+    )
 }
 
 pub fn benchmark_qs_l2_prefix_cal(

@@ -8,6 +8,7 @@ members = [
   "crates/risk-bench",
   "crates/risk-bench2",
   "crates/risk-bench3",
+  "crates/risk-bench-h2",
   "crates/risk-server-glommio",
   "crates/risk-mamba-kernel",
   "crates/risk_mamba_runner",

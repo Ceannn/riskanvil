@@ -70,6 +70,10 @@ struct Args {
     /// Benchmark-only h2c listen addr for risk-bench3, e.g. 127.0.0.1:19092
     #[arg(long)]
     bench3_h2_listen: Option<String>,
+
+    /// Sample 1/N throughput h2 bench requests for server-side stage timing metrics
+    #[arg(long, default_value_t = 1024)]
+    bench3_h2_sample_rate: usize,
 }
 
 #[derive(Clone)]
@@ -79,9 +83,12 @@ struct AppState {
     standalone_l2_bench: Option<Arc<StandaloneL2Runtime>>,
     standalone_l2_tau_mode: Option<StandaloneL2TauMode>,
     bench_in_flight: Arc<TokioSemaphore>,
+    bench_h2_sample_rate: usize,
+    bench_h2_sample_seq: Arc<AtomicU64>,
 }
 
 static TRACE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+static BENCH_H2_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn env_usize(name: &str, default_value: usize) -> usize {
     std::env::var(name)
@@ -379,6 +386,149 @@ fn encode_qsb2_response(trace_id: u64, resp: &ScoreResponse) -> Vec<u8> {
     out
 }
 
+fn encode_qsb2_record(trace_id: u64, resp: &ScoreResponse, out: &mut Vec<u8>) {
+    out.extend_from_slice(b"QSB2");
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.push(decision_to_u8(&resp.decision));
+    let flags = if resp.timings_us.l2 > 0 { 1u8 } else { 0u8 };
+    out.push(flags);
+    out.extend_from_slice(&trace_id.to_le_bytes());
+    out.extend_from_slice(&(resp.score as f32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+}
+
+fn encode_batch_aggregate_ack(
+    record_count: u32,
+    ok_count: u32,
+    used_l2_count: u32,
+    decision_counts: [u32; 5],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40);
+    out.extend_from_slice(b"RBA1");
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&record_count.to_le_bytes());
+    out.extend_from_slice(&ok_count.to_le_bytes());
+    out.extend_from_slice(&used_l2_count.to_le_bytes());
+    for count in decision_counts {
+        out.extend_from_slice(&count.to_le_bytes());
+    }
+    debug_assert!(out.len() == 40, "RBA1 response must be 40 bytes");
+    out
+}
+
+fn parse_batch_dense_payload_le(
+    body: &Bytes,
+    expected_dim: usize,
+) -> Result<(bool, usize, usize), String> {
+    if body.len() < 16 || &body[0..4] != b"RBH1" {
+        return Err("bad batch magic".to_string());
+    }
+    let version = u16::from_le_bytes([body[4], body[5]]);
+    if version != 1 {
+        return Err(format!("unsupported batch version: {}", version));
+    }
+    let flags = u16::from_le_bytes([body[6], body[7]]);
+    let record_count = u32::from_le_bytes([body[8], body[9], body[10], body[11]]) as usize;
+    let record_bytes = u32::from_le_bytes([body[12], body[13], body[14], body[15]]) as usize;
+    if record_count == 0 {
+        return Err("record_count must be > 0".to_string());
+    }
+    let has_route_meta = (flags & 1) != 0;
+    let expect_record_bytes = expected_dim
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(if has_route_meta { 40 } else { 0 }))
+        .ok_or_else(|| "record_bytes overflow".to_string())?;
+    if record_bytes != expect_record_bytes {
+        return Err(format!(
+            "record_bytes mismatch: got {} expected {}",
+            record_bytes, expect_record_bytes
+        ));
+    }
+    let expect_len = 16usize
+        .checked_add(
+            record_count
+                .checked_mul(record_bytes)
+                .ok_or_else(|| "batch length overflow".to_string())?,
+        )
+        .ok_or_else(|| "batch length overflow".to_string())?;
+    if body.len() != expect_len {
+        return Err(format!(
+            "batch body len mismatch: got {} expected {}",
+            body.len(), expect_len
+        ));
+    }
+    Ok((has_route_meta, record_count, record_bytes))
+}
+
+async fn score_dense_batch_binary_request_v1(
+    st: &AppState,
+    body: Bytes,
+    throughput_mode: bool,
+) -> Result<Bytes, (StatusCode, String)> {
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quickscorer not enabled: start server with --bundle-dir".to_string(),
+        ));
+    };
+    let (_has_route_meta, record_count, record_bytes) =
+        parse_batch_dense_payload_le(&body, expected_dim).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let mut out = Vec::with_capacity(16 + record_count * 24);
+    out.extend_from_slice(b"RBR1");
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(record_count as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for i in 0..record_count {
+        let off = 16 + i * record_bytes;
+        let rec = body.slice(off..off + record_bytes);
+        let (trace_id, resp) = score_dense_binary_request(st, rec).await?;
+        if throughput_mode && should_sample_bench_h2(st) {
+            record_bench_h2_sample_metrics(&resp);
+        }
+        encode_qsb2_record(trace_id, &resp, &mut out);
+    }
+    Ok(Bytes::from(out))
+}
+
+async fn score_dense_batch_binary_request_http_ack_v1(
+    st: &AppState,
+    body: Bytes,
+) -> Result<Bytes, (StatusCode, String)> {
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quickscorer not enabled: start server with --bundle-dir".to_string(),
+        ));
+    };
+    let (_has_route_meta, record_count, record_bytes) =
+        parse_batch_dense_payload_le(&body, expected_dim).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let mut used_l2_count = 0u32;
+    let mut decision_counts = [0u32; 5];
+    for i in 0..record_count {
+        let off = 16 + i * record_bytes;
+        let rec = body.slice(off..off + record_bytes);
+        let (_trace_id, resp) = score_dense_binary_request(st, rec).await?;
+        if resp.timings_us.l2 > 0 {
+            used_l2_count += 1;
+        }
+        let idx = match resp.decision {
+            Decision::Allow => 0,
+            Decision::Deny => 1,
+            Decision::ManualReview => 2,
+            Decision::DegradeAllow => 3,
+        };
+        decision_counts[idx] += 1;
+    }
+    Ok(Bytes::from(encode_batch_aggregate_ack(
+        record_count as u32,
+        record_count as u32,
+        used_l2_count,
+        decision_counts,
+    )))
+}
+
 fn encode_timings_header_value(resp: &ScoreResponse) -> Option<HeaderValue> {
     let ts = &resp.timings_us;
     HeaderValue::from_str(&format!(
@@ -388,6 +538,42 @@ fn encode_timings_header_value(resp: &ScoreResponse) -> Option<HeaderValue> {
     .ok()
 }
 
+fn is_throughput_bench_request<B>(req: &http::Request<B>) -> bool {
+    req.headers()
+        .get("x-risk-bench-mode")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("throughput"))
+        .unwrap_or(false)
+}
+
+fn should_sample_bench_h2(st: &AppState) -> bool {
+    let rate = st.bench_h2_sample_rate.max(1) as u64;
+    let seq = st.bench_h2_sample_seq.fetch_add(1, Ordering::Relaxed);
+    seq % rate == 0
+}
+
+fn record_bench_h2_sample_metrics(resp: &ScoreResponse) {
+    let ts = &resp.timings_us;
+    metrics::counter!("bench3_h2_samples_total").increment(1);
+    metrics::histogram!("bench3_h2_stage_parse_us").record(ts.parse as f64);
+    metrics::histogram!("bench3_h2_stage_feature_us").record(ts.feature as f64);
+    metrics::histogram!("bench3_h2_stage_router_us").record(ts.router as f64);
+    metrics::histogram!("bench3_h2_stage_l1_us").record(ts.l1 as f64);
+    metrics::histogram!("bench3_h2_stage_l2_us").record(ts.l2 as f64);
+    metrics::histogram!("bench3_h2_stage_serialize_us").record(ts.serialize as f64);
+    metrics::histogram!("bench3_h2_server_total_us").record(
+        ts.parse as f64
+            + ts.feature as f64
+            + ts.router as f64
+            + ts.l1 as f64
+            + ts.l2 as f64
+            + ts.serialize as f64,
+    );
+    if ts.l2 > 0 {
+        metrics::counter!("bench3_h2_used_l2_total").increment(1);
+    }
+}
+
 async fn handle_h2_bench_stream(
     req: http::Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
@@ -395,6 +581,7 @@ async fn handle_h2_bench_stream(
 ) -> anyhow::Result<()> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let throughput_mode = is_throughput_bench_request(&req);
     if method != Method::POST {
         let response = http::Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -409,7 +596,10 @@ async fn handle_h2_bench_stream(
         return Ok(());
     }
 
-    if path != "/score_dense_f32_bin" && path != "/score_dense_f32_bin_v2" {
+    if path != "/score_dense_f32_bin"
+        && path != "/score_dense_f32_bin_v2"
+        && path != "/score_dense_f32_batch_v1"
+    {
         let response = http::Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "text/plain")
@@ -430,8 +620,14 @@ async fn handle_h2_bench_stream(
         .await
         .context("acquire h2 bench permit")?;
 
+    let body_capacity = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4096);
     let mut body_stream = req.into_body();
-    let mut body = bytes::BytesMut::with_capacity(4096);
+    let mut body = bytes::BytesMut::with_capacity(body_capacity);
     while let Some(chunk) = body_stream.data().await {
         let chunk = chunk.context("read h2 request body")?;
         body.extend_from_slice(&chunk);
@@ -440,24 +636,45 @@ async fn handle_h2_bench_stream(
     let body = body.freeze();
 
     let outcome = match path.as_str() {
-        "/score_dense_f32_bin" => score_dense_binary_request(&st, body).await.map(|(trace_id, resp)| {
-            let bin = encode_rsk1_response(trace_id, &resp);
-            let headers: Vec<(HeaderName, HeaderValue)> = vec![(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/octet-stream"),
-            )];
-            (StatusCode::OK, headers, Bytes::from(bin))
-        }),
-        "/score_dense_f32_bin_v2" => score_dense_binary_request(&st, body).await.map(|(trace_id, resp)| {
-            let mut headers = vec![(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/octet-stream"),
-            )];
-            if let Some(v) = encode_timings_header_value(&resp) {
-                headers.push((HDR_RISK_TIMINGS_US, v));
-            }
-            (StatusCode::OK, headers, Bytes::from(encode_qsb2_response(trace_id, &resp)))
-        }),
+        "/score_dense_f32_bin" => score_dense_binary_request(&st, body)
+            .await
+            .map(|(trace_id, resp)| {
+                if throughput_mode && should_sample_bench_h2(&st) {
+                    record_bench_h2_sample_metrics(&resp);
+                }
+                let bin = encode_rsk1_response(trace_id, &resp);
+                let headers: Vec<(HeaderName, HeaderValue)> = vec![(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                )];
+                (StatusCode::OK, headers, Bytes::from(bin))
+            }),
+        "/score_dense_f32_bin_v2" => score_dense_binary_request(&st, body)
+            .await
+            .map(|(trace_id, resp)| {
+                if throughput_mode && should_sample_bench_h2(&st) {
+                    record_bench_h2_sample_metrics(&resp);
+                }
+                let mut headers = vec![(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                )];
+                if !throughput_mode {
+                    if let Some(v) = encode_timings_header_value(&resp) {
+                        headers.push((HDR_RISK_TIMINGS_US, v));
+                    }
+                }
+                (StatusCode::OK, headers, Bytes::from(encode_qsb2_response(trace_id, &resp)))
+            }),
+        "/score_dense_f32_batch_v1" => score_dense_batch_binary_request_v1(&st, body, throughput_mode)
+            .await
+            .map(|bin| {
+                let headers: Vec<(HeaderName, HeaderValue)> = vec![(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                )];
+                (StatusCode::OK, headers, bin)
+            }),
         _ => unreachable!("path already validated"),
     };
 
@@ -487,15 +704,20 @@ async fn handle_h2_bench_conn(
     let mut conn = h2::server::handshake(stream)
         .await
         .context("h2 server handshake")?;
+    let mut tasks = tokio::task::JoinSet::new();
     while let Some(result) = conn.accept().await {
         let (req, respond) = result.context("accept h2 stream")?;
         let st2 = st.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             if let Err(e) = handle_h2_bench_stream(req, respond, st2).await {
                 warn!(error = %e, "h2 bench stream failed");
             }
         });
+        while tasks.len() > 1024 {
+            let _ = tasks.join_next().await;
+        }
     }
+    while tasks.join_next().await.is_some() {}
     Ok(())
 }
 
@@ -560,6 +782,24 @@ async fn score_dense_f32_bin_v2(State(st): State<AppState>, body: Bytes) -> Resp
         }
         Err((status, msg)) => {
             error!(error = %msg, "score_dense_f32_bin_v2 failed");
+            (status, msg).into_response()
+        }
+    }
+}
+
+async fn score_dense_f32_batch_v1(State(st): State<AppState>, body: Bytes) -> Response {
+    match score_dense_batch_binary_request_http_ack_v1(&st, body).await {
+        Ok(bin) => {
+            let mut r = Response::new(axum::body::Body::from(bin));
+            *r.status_mut() = StatusCode::OK;
+            r.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            r
+        }
+        Err((status, msg)) => {
+            error!(error = %msg, "score_dense_f32_batch_v1 failed");
             (status, msg).into_response()
         }
     }
@@ -640,6 +880,10 @@ async fn async_main(
         standalone_l2_bench,
         standalone_l2_tau_mode,
         bench_in_flight: Arc::new(TokioSemaphore::new(args.max_in_flight.max(1))),
+        bench_h2_sample_rate: args.bench3_h2_sample_rate.max(1),
+        bench_h2_sample_seq: Arc::new(AtomicU64::new(
+            BENCH_H2_REQ_SEQ.fetch_add(1, Ordering::Relaxed),
+        )),
     };
 
     let app = Router::new()
@@ -648,6 +892,7 @@ async fn async_main(
         .route("/debug/backend", get(debug_backend))
         .route("/score_dense_f32_bin", post(score_dense_f32_bin))
         .route("/score_dense_f32_bin_v2", post(score_dense_f32_bin_v2))
+        .route("/score_dense_f32_batch_v1", post(score_dense_f32_batch_v1))
         .with_state(st.clone())
         .layer(
             ServiceBuilder::new()

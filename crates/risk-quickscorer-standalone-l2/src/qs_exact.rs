@@ -308,6 +308,108 @@ pub fn quantize_into(pack: &QsPack, feat: &[f32], ranks: &mut [u8], missing: &mu
 }
 
 #[inline(always)]
+fn apply_block_nomiss(
+    block: QsBlockHdr,
+    luts: &[u8],
+    masks: &[Mask128],
+    ranks: &[u8],
+    lo: u64,
+    hi: u64,
+) -> (u64, u64) {
+    let fid = block.fid as usize;
+    let rank = unsafe { *ranks.get_unchecked(fid) as usize };
+    let bucket = unsafe { *luts.get_unchecked(block.lut_off as usize + rank) as usize };
+    let mask = unsafe { *masks.get_unchecked(block.mask_off as usize + bucket) };
+    (lo & mask.lo, hi & mask.hi)
+}
+
+#[inline(always)]
+fn popcnt128(lo: u64, hi: u64) -> u32 {
+    lo.count_ones() + hi.count_ones()
+}
+
+pub fn reorder_front_blocks_sampled_nomiss(
+    pack: &mut QsPack,
+    sample_ranks: &[Vec<u8>],
+    start_tree_idx: usize,
+    end_tree_idx: usize,
+    front_blocks: usize,
+) -> Result<()> {
+    if sample_ranks.is_empty() || front_blocks == 0 || start_tree_idx >= end_tree_idx {
+        return Ok(());
+    }
+
+    let tree_end = end_tree_idx.min(pack.n_trees);
+    for tree_idx in start_tree_idx..tree_end {
+        let tree = pack.tree_hdrs[tree_idx];
+        let block_start = tree.block_off as usize;
+        let block_end = block_start + tree.block_cnt as usize;
+        let block_len = block_end - block_start;
+        if block_len <= 1 {
+            continue;
+        }
+
+        let choose = front_blocks.min(block_len);
+        let original = pack.block_hdrs[block_start..block_end].to_vec();
+        let mut remaining: Vec<usize> = (0..block_len).collect();
+        let mut chosen = Vec::with_capacity(choose);
+        let mut states = vec![(tree.init_lo, tree.init_hi); sample_ranks.len()];
+
+        for _ in 0..choose {
+            let mut best_pos = 0usize;
+            let mut best_score = i64::MIN;
+            for (cand_pos, &block_pos) in remaining.iter().enumerate() {
+                let block = original[block_pos];
+                let mut score = 0i64;
+                for (sample_idx, ranks) in sample_ranks.iter().enumerate() {
+                    let (cur_lo, cur_hi) = states[sample_idx];
+                    if resolved(cur_lo, cur_hi) {
+                        continue;
+                    }
+                    let (next_lo, next_hi) =
+                        apply_block_nomiss(block, &pack.luts, &pack.masks, ranks, cur_lo, cur_hi);
+                    let cur_half = (cur_lo == 0) ^ (cur_hi == 0);
+                    let next_half = (next_lo == 0) ^ (next_hi == 0);
+                    let cur_pop = popcnt128(cur_lo, cur_hi) as i64;
+                    let next_pop = popcnt128(next_lo, next_hi) as i64;
+                    if resolved(next_lo, next_hi) {
+                        score += 1_000_000;
+                    } else if !cur_half && next_half {
+                        score += 10_000;
+                    }
+                    score += cur_pop - next_pop;
+                }
+                if score > best_score {
+                    best_score = score;
+                    best_pos = cand_pos;
+                }
+            }
+
+            let block_pos = remaining.remove(best_pos);
+            let block = original[block_pos];
+            for (sample_idx, ranks) in sample_ranks.iter().enumerate() {
+                let (cur_lo, cur_hi) = states[sample_idx];
+                if resolved(cur_lo, cur_hi) {
+                    continue;
+                }
+                states[sample_idx] =
+                    apply_block_nomiss(block, &pack.luts, &pack.masks, ranks, cur_lo, cur_hi);
+            }
+            chosen.push(block);
+        }
+
+        let mut out = Vec::with_capacity(block_len);
+        out.extend_from_slice(&chosen);
+        for block_pos in remaining {
+            out.push(original[block_pos]);
+        }
+        pack.block_hdrs[block_start..block_end].copy_from_slice(&out);
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
 fn score_tree_quantized(
     pack: &QsPack,
     tree: &QsTreeHdr,

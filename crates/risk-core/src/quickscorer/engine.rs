@@ -19,6 +19,9 @@ struct QuickTlsScratch {
     l1_feat: Vec<f32>,
     l2_row: Vec<f32>,
     seg_key_buf: Vec<u8>,
+    batch_l1: Vec<f32>,
+    batch_l1_scores: Vec<f32>,
+    batch_survivors: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -112,13 +115,202 @@ impl QuickScorerEngine {
             let mut scratch = cell.borrow_mut();
             decode_dense_f32le_into(l1_bytes, l1_dim, &mut scratch.l1_feat)?;
             let t_l1 = Instant::now();
-            let l1_out = self.runtime.predict_l1_feat_nomiss(scratch.l1_feat.as_slice())?;
+            let l1_out = self
+                .runtime
+                .predict_l1_feat_nomiss(scratch.l1_feat.as_slice())?;
             Ok(QuickL1PredictOutput {
                 l1_score: l1_out.score,
                 passed: l1_out.passed,
                 l1_us: elapsed_us(t_l1),
                 router_us: elapsed_us(t_router),
             })
+        })
+    }
+
+    pub fn predict_l1_only_batch128_from_bytes(
+        &self,
+        rows: &[&[u8]; 128],
+    ) -> anyhow::Result<[QuickL1PredictOutput; 128]> {
+        let l1_need = self
+            .policy
+            .l1_dim
+            .checked_mul(4)
+            .ok_or_else(|| anyhow!("l1_dim too large"))?;
+        let t_router = Instant::now();
+        let l1_dim = self.policy.l1_dim;
+
+        QUICK_TLS_SCRATCH.with(|cell| -> anyhow::Result<[QuickL1PredictOutput; 128]> {
+            let mut scratch = cell.borrow_mut();
+            let batch_l1 = &mut scratch.batch_l1;
+            let mut outs = std::array::from_fn(|_| QuickL1PredictOutput {
+                l1_score: 0.0,
+                passed: false,
+                l1_us: 0,
+                router_us: 0,
+            });
+            let batch_need = 128usize
+                .checked_mul(l1_dim)
+                .ok_or_else(|| anyhow!("batch l1 scratch too large"))?;
+            if batch_l1.len() != batch_need {
+                batch_l1.resize(batch_need, 0.0);
+            }
+            for i in 0..128 {
+                let l1_bytes = rows[i];
+                ensure!(
+                    l1_bytes.len() == l1_need,
+                    "quickscorer input size mismatch: got={}, expect={} (l1_dim={})",
+                    l1_bytes.len(),
+                    l1_need,
+                    l1_dim
+                );
+                let row_off = i * l1_dim;
+                let l1_feat_row = &mut batch_l1[row_off..row_off + l1_dim];
+                #[cfg(target_endian = "little")]
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        l1_bytes.as_ptr(),
+                        l1_feat_row.as_mut_ptr() as *mut u8,
+                        l1_need,
+                    );
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    for (j, slot) in l1_feat_row.iter_mut().enumerate() {
+                        let off = j * 4;
+                        *slot = f32::from_le_bytes([
+                            l1_bytes[off],
+                            l1_bytes[off + 1],
+                            l1_bytes[off + 2],
+                            l1_bytes[off + 3],
+                        ]);
+                    }
+                }
+                let t_l1 = Instant::now();
+                let l1_out = self.runtime.predict_l1_feat_nomiss(l1_feat_row)?;
+                outs[i] = QuickL1PredictOutput {
+                    l1_score: l1_out.score,
+                    passed: l1_out.passed,
+                    l1_us: elapsed_us(t_l1),
+                    router_us: elapsed_us(t_router),
+                };
+            }
+            Ok(outs)
+        })
+    }
+
+    pub fn predict_batch128_counts_from_l1_bytes_with_meta(
+        &self,
+        rows: &[&[u8]; 128],
+        route_metas: &[Option<QuickRouteMeta>; 128],
+    ) -> anyhow::Result<(u32, [u32; 5])> {
+        let l1_need = self
+            .policy
+            .l1_dim
+            .checked_mul(4)
+            .ok_or_else(|| anyhow!("l1_dim too large"))?;
+        let l1_dim = self.policy.l1_dim;
+        let Some(l2_policy) = self.policy.l2.as_ref() else {
+            let l1_outs = self.predict_l1_only_batch128_from_bytes(rows)?;
+            let mut decision_counts = [0u32; 5];
+            for out in l1_outs {
+                let idx = if out.passed { 0 } else { 2 };
+                decision_counts[idx] += 1;
+            }
+            return Ok((0, decision_counts));
+        };
+
+        QUICK_TLS_SCRATCH.with(|cell| -> anyhow::Result<(u32, [u32; 5])> {
+            let mut scratch = cell.borrow_mut();
+            let QuickTlsScratch {
+                l1_feat: _,
+                l2_row,
+                seg_key_buf,
+                batch_l1,
+                batch_l1_scores,
+                batch_survivors,
+            } = &mut *scratch;
+            let mut used_l2_count = 0u32;
+            let mut decision_counts = [0u32; 5];
+            let batch_need = 128usize
+                .checked_mul(l1_dim)
+                .ok_or_else(|| anyhow!("batch l1 scratch too large"))?;
+            if batch_l1.len() != batch_need {
+                batch_l1.resize(batch_need, 0.0);
+            }
+            if batch_l1_scores.len() != 128 {
+                batch_l1_scores.resize(128, 0.0);
+            }
+            batch_survivors.clear();
+
+            for i in 0..128 {
+                let l1_bytes = rows[i];
+                ensure!(
+                    l1_bytes.len() == l1_need,
+                    "quickscorer input size mismatch: got={}, expect={} (l1_dim={})",
+                    l1_bytes.len(),
+                    l1_need,
+                    l1_dim
+                );
+                let row_off = i * l1_dim;
+                let l1_feat_row = &mut batch_l1[row_off..row_off + l1_dim];
+                #[cfg(target_endian = "little")]
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        l1_bytes.as_ptr(),
+                        l1_feat_row.as_mut_ptr() as *mut u8,
+                        l1_need,
+                    );
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    for (j, slot) in l1_feat_row.iter_mut().enumerate() {
+                        let off = j * 4;
+                        *slot = f32::from_le_bytes([
+                            l1_bytes[off],
+                            l1_bytes[off + 1],
+                            l1_bytes[off + 2],
+                            l1_bytes[off + 3],
+                        ]);
+                    }
+                }
+                let l1_out = self.runtime.predict_l1_feat_nomiss(l1_feat_row)?;
+                let l1_score = l1_out.score;
+                batch_l1_scores[i] = l1_score;
+
+                if l1_out.passed {
+                    decision_counts[0] += 1;
+                } else {
+                    batch_survivors.push(i);
+                }
+            }
+
+            for &i in batch_survivors.iter() {
+                let row_off = i * l1_dim;
+                let l1_feat_row = &batch_l1[row_off..row_off + l1_dim];
+                let l1_score = batch_l1_scores[i];
+                materialize_l2_row_into(l1_feat_row, l1_score, l2_policy, l2_row);
+                let l2_resolved = l2_policy.resolve_threshold_with_route_meta(
+                    l2_row.as_slice(),
+                    route_metas[i].as_ref(),
+                    seg_key_buf,
+                )?;
+                let l2_out = self.runtime.predict_l2_row_nomiss(
+                    l2_row.as_slice(),
+                    l2_resolved.tau,
+                    l2_resolved.fold,
+                )?;
+                used_l2_count += 1;
+                let reject = l2_is_reject(l2_out.score, l2_resolved.tau);
+                let idx = match final_decision(false, Some(reject)) {
+                    Decision::Allow => 0,
+                    Decision::Deny => 1,
+                    Decision::ManualReview => 2,
+                    Decision::DegradeAllow => 3,
+                };
+                decision_counts[idx] += 1;
+            }
+
+            Ok((used_l2_count, decision_counts))
         })
     }
 
@@ -170,6 +362,7 @@ impl QuickScorerEngine {
                 l1_feat,
                 l2_row,
                 seg_key_buf,
+                ..
             } = &mut *scratch;
 
             decode_dense_f32le_into(l1_bytes, l1_dim, l1_feat)?;

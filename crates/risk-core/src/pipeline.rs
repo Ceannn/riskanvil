@@ -1,4 +1,4 @@
-use crate::quickscorer::{QuickRouteMeta, QuickScorerEngine};
+use crate::quickscorer::{QuickL1PredictOutput, QuickRouteMeta, QuickScorerEngine};
 use crate::{
     config::Config,
     schema::{ReasonItem, ScoreResponse, TimingsUs},
@@ -15,6 +15,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+pub struct BatchScoreLite {
+    pub decision: crate::schema::Decision,
+    pub used_l2: bool,
+}
 
 #[derive(Debug)]
 struct RateBudget {
@@ -485,6 +491,173 @@ impl AppCore {
         record_serialize_metrics(&mut resp);
         record_e2e_metrics(t0);
         Ok(resp)
+    }
+
+    pub fn predict_quick_l1_only_bytes(
+        &self,
+        row_bytes_le: &[u8],
+    ) -> anyhow::Result<QuickL1PredictOutput> {
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+        quick.predict_l1_only_from_bytes(row_bytes_le)
+    }
+
+    pub fn score_quick_dense_bytes_with_meta_batch_lite(
+        &self,
+        row_bytes_le: &[u8],
+        route_meta: Option<&QuickRouteMeta>,
+    ) -> anyhow::Result<BatchScoreLite> {
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+        let out = quick.predict_from_l1_bytes_with_meta(row_bytes_le, route_meta)?;
+        crate::batched_counter!("router_l2_trigger_total").increment(u64::from(out.used_l2));
+        Ok(BatchScoreLite {
+            decision: out.decision,
+            used_l2: out.used_l2,
+        })
+    }
+
+    pub fn predict_quick_l1_only_batch128_bytes(
+        &self,
+        rows: &[&[u8]; 128],
+    ) -> anyhow::Result<[QuickL1PredictOutput; 128]> {
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+        quick.predict_l1_only_batch128_from_bytes(rows)
+    }
+
+    pub fn score_quick_dense_batch128_http_ack_lite(
+        &self,
+        rows: &[&[u8]; 128],
+        metas: &[Option<QuickRouteMeta>; 128],
+    ) -> anyhow::Result<(u32, [u32; 5])> {
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+        let (used_l2_count, decision_counts) =
+            quick.predict_batch128_counts_from_l1_bytes_with_meta(rows, metas)?;
+        crate::batched_counter!("router_l2_trigger_total").increment(used_l2_count as u64);
+        Ok((used_l2_count, decision_counts))
+    }
+
+    pub fn score_standalone_batch128_http_ack_lite(
+        &self,
+        rows: &[&[u8]; 128],
+        metas: &[Option<QuickRouteMeta>; 128],
+        standalone_l2: &StandaloneL2Runtime,
+        tau_mode: StandaloneL2TauMode,
+    ) -> anyhow::Result<(u32, [u32; 5])> {
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+        let l1_outs = quick.predict_l1_only_batch128_from_bytes(rows)?;
+        let mut used_l2_count = 0u32;
+        let mut decision_counts = [0u32; 5];
+        let mut pending_sidecar_row_idx = [0usize; 128];
+        let mut pending_fold_id = [0i32; 128];
+        let mut pending_tau = [0f32; 128];
+        let mut pending_len = 0usize;
+
+        for i in 0..128 {
+            if l1_outs[i].passed {
+                decision_counts[0] += 1;
+            } else {
+                let route_meta = metas[i];
+                pending_sidecar_row_idx[pending_len] =
+                    route_meta.map(|m| m.row_idx as usize).unwrap_or(i);
+                pending_fold_id[pending_len] = route_meta.map(|m| m.fold_id).unwrap_or(0);
+                pending_tau[pending_len] = match tau_mode {
+                    StandaloneL2TauMode::Request => {
+                        route_meta.and_then(|m| m.l2_tau_used).context(
+                            "benchmark-only standalone L2 mode requires l2_tau_used in request",
+                        )?
+                    }
+                    StandaloneL2TauMode::Fixed(v) => v,
+                };
+                pending_len += 1;
+            }
+        }
+
+        TLS_STANDALONE_L2_SCRATCH.with(|cell| -> anyhow::Result<()> {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(standalone_l2.new_scratch());
+            }
+            let scratch = slot.as_mut().expect("scratch initialized");
+
+            for slot in 0..pending_len {
+                crate::batched_counter!("router_l2_trigger_total").increment(1);
+                let l2_out = standalone_l2.predict_l2_row_by_index_with_scratch(
+                    pending_sidecar_row_idx[slot] % standalone_l2.feat_rows(),
+                    pending_tau[slot],
+                    pending_fold_id[slot],
+                    scratch,
+                )?;
+                used_l2_count += 1;
+                let idx = if l2_out.reject { 1 } else { 2 };
+                decision_counts[idx] += 1;
+            }
+
+            Ok(())
+        })?;
+
+        Ok((used_l2_count, decision_counts))
+    }
+
+    pub fn score_standalone_l2_from_l1_batch_lite(
+        &self,
+        l1_out: QuickL1PredictOutput,
+        route_meta: Option<&QuickRouteMeta>,
+        standalone_l2: &StandaloneL2Runtime,
+        sidecar_row_idx: usize,
+        tau_mode: StandaloneL2TauMode,
+    ) -> anyhow::Result<BatchScoreLite> {
+        if l1_out.passed {
+            crate::batched_counter!("router_l2_trigger_total").increment(0);
+            return Ok(BatchScoreLite {
+                decision: crate::schema::Decision::Allow,
+                used_l2: false,
+            });
+        }
+
+        crate::batched_counter!("router_l2_trigger_total").increment(1);
+        let tau = match tau_mode {
+            StandaloneL2TauMode::Request => route_meta
+                .and_then(|m| m.l2_tau_used)
+                .context("benchmark-only standalone L2 mode requires l2_tau_used in request")?,
+            StandaloneL2TauMode::Fixed(v) => v,
+        };
+        let fold_id = route_meta.map(|m| m.fold_id).unwrap_or(0);
+        let l2_out = TLS_STANDALONE_L2_SCRATCH.with(|cell| -> anyhow::Result<_> {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(standalone_l2.new_scratch());
+            }
+            let scratch = slot.as_mut().expect("scratch initialized");
+            standalone_l2.predict_l2_row_by_index_with_scratch(
+                sidecar_row_idx % standalone_l2.feat_rows(),
+                tau,
+                fold_id,
+                scratch,
+            )
+        })?;
+        let decision = if l2_out.reject {
+            crate::schema::Decision::Deny
+        } else {
+            crate::schema::Decision::ManualReview
+        };
+        Ok(BatchScoreLite {
+            decision,
+            used_l2: true,
+        })
     }
 
     pub async fn score_quick_dense_bytes_with_standalone_bench_l2_async(

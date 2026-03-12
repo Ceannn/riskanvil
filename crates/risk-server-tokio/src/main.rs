@@ -1,9 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{net::SocketAddr, path::Path, str::FromStr, sync::Arc, time::Instant};
+use std::{
+    convert::Infallible, net::SocketAddr, path::Path, str::FromStr, sync::Arc, time::Instant,
+};
 
 use anyhow::Context;
 use axum::{
-    body::Bytes,
+    body::{Body as AxumBody, Bytes},
     error_handling::HandleErrorLayer,
     extract::State,
     http,
@@ -12,7 +14,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use bytes::BytesMut;
 use clap::Parser;
+use http_body_util::BodyExt;
+use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use risk_core::{
     config::Config,
@@ -23,7 +29,7 @@ use risk_core::{
 };
 use risk_quickscorer_standalone_l2::StandaloneL2Runtime;
 use tokio::sync::Semaphore as TokioSemaphore;
-use tower::{BoxError, ServiceBuilder};
+use tower::{BoxError, ServiceBuilder, ServiceExt};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -89,6 +95,20 @@ struct AppState {
 
 static TRACE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 static BENCH_H2_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+enum H1BatchFastPath {
+    Score,
+    Null,
+    ParseOnly,
+}
+
+#[derive(Clone, Copy)]
+struct Batch128Shape {
+    has_route_meta: bool,
+    record_bytes: usize,
+    content_len: usize,
+}
 
 fn env_usize(name: &str, default_value: usize) -> usize {
     std::env::var(name)
@@ -402,18 +422,18 @@ fn encode_batch_aggregate_ack(
     ok_count: u32,
     used_l2_count: u32,
     decision_counts: [u32; 5],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(40);
-    out.extend_from_slice(b"RBA1");
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&record_count.to_le_bytes());
-    out.extend_from_slice(&ok_count.to_le_bytes());
-    out.extend_from_slice(&used_l2_count.to_le_bytes());
-    for count in decision_counts {
-        out.extend_from_slice(&count.to_le_bytes());
+) -> [u8; 40] {
+    let mut out = [0u8; 40];
+    out[0..4].copy_from_slice(b"RBA1");
+    out[4..6].copy_from_slice(&1u16.to_le_bytes());
+    out[6..8].copy_from_slice(&0u16.to_le_bytes());
+    out[8..12].copy_from_slice(&record_count.to_le_bytes());
+    out[12..16].copy_from_slice(&ok_count.to_le_bytes());
+    out[16..20].copy_from_slice(&used_l2_count.to_le_bytes());
+    for (i, count) in decision_counts.into_iter().enumerate() {
+        let off = 20 + i * 4;
+        out[off..off + 4].copy_from_slice(&count.to_le_bytes());
     }
-    debug_assert!(out.len() == 40, "RBA1 response must be 40 bytes");
     out
 }
 
@@ -455,10 +475,183 @@ fn parse_batch_dense_payload_le(
     if body.len() != expect_len {
         return Err(format!(
             "batch body len mismatch: got {} expected {}",
-            body.len(), expect_len
+            body.len(),
+            expect_len
         ));
     }
     Ok((has_route_meta, record_count, record_bytes))
+}
+
+fn batch128_shape_for_content_len(
+    expected_dim: usize,
+    content_len: usize,
+) -> Option<Batch128Shape> {
+    let raw_record_bytes = expected_dim.checked_mul(4)?;
+    let route_record_bytes = raw_record_bytes.checked_add(40)?;
+    let raw_len = 16usize.checked_add(128usize.checked_mul(raw_record_bytes)?)?;
+    if content_len == raw_len {
+        return Some(Batch128Shape {
+            has_route_meta: false,
+            record_bytes: raw_record_bytes,
+            content_len,
+        });
+    }
+    let route_len = 16usize.checked_add(128usize.checked_mul(route_record_bytes)?)?;
+    if content_len == route_len {
+        return Some(Batch128Shape {
+            has_route_meta: true,
+            record_bytes: route_record_bytes,
+            content_len,
+        });
+    }
+    None
+}
+
+fn validate_batch128_header(
+    body: &[u8],
+    has_route_meta: bool,
+    record_bytes: usize,
+) -> Result<(), String> {
+    if body.len() < 16 {
+        return Err("body too short for batch header".to_string());
+    }
+    if &body[0..4] != b"RBH1" {
+        return Err("bad batch magic".to_string());
+    }
+    let version = u16::from_le_bytes([body[4], body[5]]);
+    if version != 1 {
+        return Err(format!("unsupported batch version: {}", version));
+    }
+    let flags = u16::from_le_bytes([body[6], body[7]]);
+    let expect_flags = if has_route_meta { 1u16 } else { 0u16 };
+    if flags != expect_flags {
+        return Err(format!(
+            "batch flags mismatch: got {} expected {}",
+            flags, expect_flags
+        ));
+    }
+    let record_count = u32::from_le_bytes([body[8], body[9], body[10], body[11]]) as usize;
+    if record_count != 128 {
+        return Err(format!(
+            "record_count mismatch: got {} expected 128",
+            record_count
+        ));
+    }
+    let got_record_bytes = u32::from_le_bytes([body[12], body[13], body[14], body[15]]) as usize;
+    if got_record_bytes != record_bytes {
+        return Err(format!(
+            "record_bytes mismatch: got {} expected {}",
+            got_record_bytes, record_bytes
+        ));
+    }
+    Ok(())
+}
+
+fn parse_batch_record_ref<'a>(
+    record: &'a [u8],
+    has_route_meta: bool,
+) -> Result<(&'a [u8], Option<QuickRouteMeta>), String> {
+    if !has_route_meta {
+        return Ok((record, None));
+    }
+    if record.len() < 40 || &record[0..4] != b"RVEC" {
+        return Err("batch record missing RVEC header".to_string());
+    }
+    let ver = u16::from_le_bytes([record[4], record[5]]);
+    if ver != 3 {
+        return Err(format!("unsupported batch RVEC version: {}", ver));
+    }
+    let flags = u16::from_le_bytes([record[6], record[7]]);
+    if flags != 0 {
+        return Err(format!("unsupported batch RVEC flags: {}", flags));
+    }
+    let dim = u32::from_le_bytes([record[8], record[9], record[10], record[11]]) as usize;
+    let payload_len = dim
+        .checked_mul(4)
+        .ok_or_else(|| "batch record payload overflow".to_string())?;
+    if record.len() != 40 + payload_len {
+        return Err(format!(
+            "batch record len mismatch: got {} expected {}",
+            record.len(),
+            40 + payload_len
+        ));
+    }
+    let fold_id = i32::from_le_bytes([record[12], record[13], record[14], record[15]]);
+    let seg_prod_amtbin = u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
+    let transaction_id = u64::from_le_bytes([
+        record[20], record[21], record[22], record[23], record[24], record[25], record[26],
+        record[27],
+    ]);
+    let row_idx = u32::from_le_bytes([record[28], record[29], record[30], record[31]]);
+    let l2_tau_used = f32::from_le_bytes([record[32], record[33], record[34], record[35]]);
+    Ok((
+        &record[40..],
+        Some(QuickRouteMeta {
+            row_idx,
+            transaction_id,
+            fold_id,
+            seg_prod_amtbin,
+            l2_tau_used: Some(l2_tau_used),
+        }),
+    ))
+}
+
+struct Batch128Refs<'a> {
+    rows: [&'a [u8]; 128],
+    metas: [Option<QuickRouteMeta>; 128],
+}
+
+fn parse_batch128_refs<'a>(
+    body: &'a [u8],
+    has_route_meta: bool,
+    record_bytes: usize,
+) -> Result<Batch128Refs<'a>, String> {
+    let mut rows = std::array::from_fn(|_| &body[0..0]);
+    let mut metas = [None; 128];
+    if has_route_meta {
+        for i in 0..128 {
+            let off = 16 + i * record_bytes;
+            let rec = &body[off..off + record_bytes];
+            if rec.len() < 40 || &rec[0..4] != b"RVEC" {
+                return Err("batch record missing RVEC header".to_string());
+            }
+            let ver = u16::from_le_bytes([rec[4], rec[5]]);
+            if ver != 3 {
+                return Err(format!("unsupported batch RVEC version: {}", ver));
+            }
+            let flags = u16::from_le_bytes([rec[6], rec[7]]);
+            if flags != 0 {
+                return Err(format!("unsupported batch RVEC flags: {}", flags));
+            }
+            let dim = u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]) as usize;
+            let payload_len = dim
+                .checked_mul(4)
+                .ok_or_else(|| "batch record payload overflow".to_string())?;
+            if rec.len() != 40 + payload_len {
+                return Err(format!(
+                    "batch record len mismatch: got {} expected {}",
+                    rec.len(),
+                    40 + payload_len
+                ));
+            }
+            rows[i] = &rec[40..];
+            metas[i] = Some(QuickRouteMeta {
+                fold_id: i32::from_le_bytes([rec[12], rec[13], rec[14], rec[15]]),
+                seg_prod_amtbin: u32::from_le_bytes([rec[16], rec[17], rec[18], rec[19]]),
+                transaction_id: u64::from_le_bytes([
+                    rec[20], rec[21], rec[22], rec[23], rec[24], rec[25], rec[26], rec[27],
+                ]),
+                row_idx: u32::from_le_bytes([rec[28], rec[29], rec[30], rec[31]]),
+                l2_tau_used: Some(f32::from_le_bytes([rec[32], rec[33], rec[34], rec[35]])),
+            });
+        }
+    } else {
+        for i in 0..128 {
+            let off = 16 + i * record_bytes;
+            rows[i] = &body[off..off + record_bytes];
+        }
+    }
+    Ok(Batch128Refs { rows, metas })
 }
 
 async fn score_dense_batch_binary_request_v1(
@@ -473,7 +666,8 @@ async fn score_dense_batch_binary_request_v1(
         ));
     };
     let (_has_route_meta, record_count, record_bytes) =
-        parse_batch_dense_payload_le(&body, expected_dim).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+        parse_batch_dense_payload_le(&body, expected_dim)
+            .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let mut out = Vec::with_capacity(16 + record_count * 24);
     out.extend_from_slice(b"RBR1");
     out.extend_from_slice(&1u16.to_le_bytes());
@@ -503,30 +697,403 @@ async fn score_dense_batch_binary_request_http_ack_v1(
         ));
     };
     let (_has_route_meta, record_count, record_bytes) =
-        parse_batch_dense_payload_le(&body, expected_dim).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+        parse_batch_dense_payload_le(&body, expected_dim)
+            .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    if record_count == 128 {
+        return score_dense_batch_binary_request_http_ack_v1_batch128(
+            st,
+            body,
+            _has_route_meta,
+            record_bytes,
+        );
+    }
     let mut used_l2_count = 0u32;
     let mut decision_counts = [0u32; 5];
-    for i in 0..record_count {
-        let off = 16 + i * record_bytes;
-        let rec = body.slice(off..off + record_bytes);
-        let (_trace_id, resp) = score_dense_binary_request(st, rec).await?;
-        if resp.timings_us.l2 > 0 {
-            used_l2_count += 1;
+    st.core.quick.as_ref().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quickscorer not enabled: start server with --bundle-dir".to_string(),
+        )
+    })?;
+
+    if let (Some(rt), Some(tau_mode)) = (st.standalone_l2_bench.as_ref(), st.standalone_l2_tau_mode)
+    {
+        let mut pending_l2 = Vec::with_capacity(record_count / 4 + 1);
+        for i in 0..record_count {
+            let off = 16 + i * record_bytes;
+            let rec = &body[off..off + record_bytes];
+            let (row_bytes, route_meta) = parse_batch_record_ref(rec, _has_route_meta)
+                .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+            let l1_out = st
+                .core
+                .predict_quick_l1_only_bytes(row_bytes)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("quickscorer l1 inference failed: {:#}", e),
+                    )
+                })?;
+            if l1_out.passed {
+                decision_counts[0] += 1;
+            } else {
+                let sidecar_row_idx = route_meta.as_ref().map(|m| m.row_idx as usize).unwrap_or(i);
+                pending_l2.push((route_meta, sidecar_row_idx, l1_out));
+            }
         }
-        let idx = match resp.decision {
-            Decision::Allow => 0,
-            Decision::Deny => 1,
-            Decision::ManualReview => 2,
-            Decision::DegradeAllow => 3,
-        };
-        decision_counts[idx] += 1;
+        for (route_meta, sidecar_row_idx, l1_out) in pending_l2 {
+            let lite = st
+                .core
+                .score_standalone_l2_from_l1_batch_lite(
+                    l1_out,
+                    route_meta.as_ref(),
+                    rt,
+                    sidecar_row_idx,
+                    tau_mode,
+                )
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("quickscorer standalone batch l2 failed: {:#}", e),
+                    )
+                })?;
+            used_l2_count += u32::from(lite.used_l2);
+            let idx = match lite.decision {
+                Decision::Allow => 0,
+                Decision::Deny => 1,
+                Decision::ManualReview => 2,
+                Decision::DegradeAllow => 3,
+            };
+            decision_counts[idx] += 1;
+        }
+    } else {
+        for i in 0..record_count {
+            let off = 16 + i * record_bytes;
+            let rec = &body[off..off + record_bytes];
+            let (row_bytes, route_meta) = parse_batch_record_ref(rec, _has_route_meta)
+                .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+            let lite = st
+                .core
+                .score_quick_dense_bytes_with_meta_batch_lite(row_bytes, route_meta.as_ref())
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("quickscorer batch inference failed: {:#}", e),
+                    )
+                })?;
+            used_l2_count += u32::from(lite.used_l2);
+            let idx = match lite.decision {
+                Decision::Allow => 0,
+                Decision::Deny => 1,
+                Decision::ManualReview => 2,
+                Decision::DegradeAllow => 3,
+            };
+            decision_counts[idx] += 1;
+        }
     }
-    Ok(Bytes::from(encode_batch_aggregate_ack(
+    Ok(Bytes::copy_from_slice(&encode_batch_aggregate_ack(
         record_count as u32,
         record_count as u32,
         used_l2_count,
         decision_counts,
     )))
+}
+
+fn score_dense_batch_null_request_http_ack_v1(
+    st: &AppState,
+    body: Bytes,
+) -> Result<Bytes, (StatusCode, String)> {
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quickscorer not enabled: start server with --bundle-dir".to_string(),
+        ));
+    };
+    let (_has_route_meta, record_count, _record_bytes) =
+        parse_batch_dense_payload_le(&body, expected_dim)
+            .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    Ok(Bytes::copy_from_slice(&encode_batch_aggregate_ack(
+        record_count as u32,
+        record_count as u32,
+        0,
+        [record_count as u32, 0, 0, 0, 0],
+    )))
+}
+
+fn score_dense_batch_parse_only_request_http_ack_v1(
+    st: &AppState,
+    body: Bytes,
+) -> Result<Bytes, (StatusCode, String)> {
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quickscorer not enabled: start server with --bundle-dir".to_string(),
+        ));
+    };
+    let (has_route_meta, record_count, record_bytes) =
+        parse_batch_dense_payload_le(&body, expected_dim)
+            .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    for i in 0..record_count {
+        let off = 16 + i * record_bytes;
+        let rec = &body[off..off + record_bytes];
+        let _ = parse_batch_record_ref(rec, has_route_meta)
+            .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    }
+    Ok(Bytes::copy_from_slice(&encode_batch_aggregate_ack(
+        record_count as u32,
+        record_count as u32,
+        0,
+        [record_count as u32, 0, 0, 0, 0],
+    )))
+}
+
+fn score_dense_batch_binary_request_http_ack_v1_batch128(
+    st: &AppState,
+    body: Bytes,
+    has_route_meta: bool,
+    record_bytes: usize,
+) -> Result<Bytes, (StatusCode, String)> {
+    let refs = parse_batch128_refs(&body, has_route_meta, record_bytes)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+
+    st.core.quick.as_ref().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quickscorer not enabled: start server with --bundle-dir".to_string(),
+        )
+    })?;
+
+    let (used_l2_count, decision_counts) = if let (Some(rt), Some(tau_mode)) =
+        (st.standalone_l2_bench.as_ref(), st.standalone_l2_tau_mode)
+    {
+        st.core
+            .score_standalone_batch128_http_ack_lite(&refs.rows, &refs.metas, rt, tau_mode)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("quickscorer standalone batch128 inference failed: {:#}", e),
+                )
+            })?
+    } else {
+        st.core
+            .score_quick_dense_batch128_http_ack_lite(&refs.rows, &refs.metas)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("quickscorer batch128 inference failed: {:#}", e),
+                )
+            })?
+    };
+
+    Ok(Bytes::copy_from_slice(&encode_batch_aggregate_ack(
+        128,
+        128,
+        used_l2_count,
+        decision_counts,
+    )))
+}
+
+fn batch_binary_response(bin: Bytes) -> Response {
+    let mut r = Response::new(AxumBody::from(bin));
+    *r.status_mut() = StatusCode::OK;
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    r
+}
+
+fn text_status_response(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, msg.into()).into_response()
+}
+
+fn h1_batch_fast_path(path: &str) -> Option<H1BatchFastPath> {
+    match path {
+        "/score_dense_f32_batch_v1" => Some(H1BatchFastPath::Score),
+        "/score_dense_f32_batch_null_v1" => Some(H1BatchFastPath::Null),
+        "/score_dense_f32_batch_parseonly_v1" => Some(H1BatchFastPath::ParseOnly),
+        _ => None,
+    }
+}
+
+async fn read_fixed_body(mut body: Incoming, content_len: usize) -> Result<Bytes, String> {
+    let mut buf = BytesMut::with_capacity(content_len);
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| format!("read request body failed: {e}"))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if buf.len().saturating_add(data.len()) > content_len {
+            return Err(format!(
+                "request body exceeded content-length: {} > {}",
+                buf.len() + data.len(),
+                content_len
+            ));
+        }
+        buf.extend_from_slice(&data);
+    }
+    if buf.len() != content_len {
+        return Err(format!(
+            "request body truncated: got {} expected {}",
+            buf.len(),
+            content_len
+        ));
+    }
+    Ok(buf.freeze())
+}
+
+fn score_dense_batch_null_request_http_ack_v1_batch128(
+    body: &[u8],
+    has_route_meta: bool,
+    record_bytes: usize,
+) -> Result<Bytes, (StatusCode, String)> {
+    validate_batch128_header(body, has_route_meta, record_bytes)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    Ok(Bytes::copy_from_slice(&encode_batch_aggregate_ack(
+        128,
+        128,
+        0,
+        [128, 0, 0, 0, 0],
+    )))
+}
+
+fn score_dense_batch_parse_only_request_http_ack_v1_batch128(
+    body: Bytes,
+    has_route_meta: bool,
+    record_bytes: usize,
+) -> Result<Bytes, (StatusCode, String)> {
+    validate_batch128_header(body.as_ref(), has_route_meta, record_bytes)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let refs = parse_batch128_refs(body.as_ref(), has_route_meta, record_bytes)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let _ = refs;
+    Ok(Bytes::copy_from_slice(&encode_batch_aggregate_ack(
+        128,
+        128,
+        0,
+        [128, 0, 0, 0, 0],
+    )))
+}
+
+async fn handle_h1_batch_fast_request(
+    st: AppState,
+    fast_path: H1BatchFastPath,
+    req: http::Request<Incoming>,
+) -> Response {
+    if req.method() != Method::POST {
+        return text_status_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+
+    let _permit = match st.bench_in_flight.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return text_status_response(StatusCode::TOO_MANY_REQUESTS, "overloaded"),
+    };
+
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
+        return text_status_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quickscorer not enabled: start server with --bundle-dir",
+        );
+    };
+
+    let content_len = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let (_, body) = req.into_parts();
+    let body = if let Some(shape) =
+        content_len.and_then(|len| batch128_shape_for_content_len(expected_dim, len))
+    {
+        match read_fixed_body(body, shape.content_len).await {
+            Ok(body) => {
+                let outcome = match fast_path {
+                    H1BatchFastPath::Score => {
+                        score_dense_batch_binary_request_http_ack_v1_batch128(
+                            &st,
+                            body,
+                            shape.has_route_meta,
+                            shape.record_bytes,
+                        )
+                    }
+                    H1BatchFastPath::Null => score_dense_batch_null_request_http_ack_v1_batch128(
+                        body.as_ref(),
+                        shape.has_route_meta,
+                        shape.record_bytes,
+                    ),
+                    H1BatchFastPath::ParseOnly => {
+                        score_dense_batch_parse_only_request_http_ack_v1_batch128(
+                            body,
+                            shape.has_route_meta,
+                            shape.record_bytes,
+                        )
+                    }
+                };
+                return match outcome {
+                    Ok(bin) => batch_binary_response(bin),
+                    Err((status, msg)) => {
+                        error!(error = %msg, "h1 batch fixed128 fast path failed");
+                        text_status_response(status, msg)
+                    }
+                };
+            }
+            Err(msg) => return text_status_response(StatusCode::BAD_REQUEST, msg),
+        }
+    } else {
+        match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                return text_status_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("read request body failed: {e}"),
+                )
+            }
+        }
+    };
+
+    let outcome = match fast_path {
+        H1BatchFastPath::Score => score_dense_batch_binary_request_http_ack_v1(&st, body).await,
+        H1BatchFastPath::Null => score_dense_batch_null_request_http_ack_v1(&st, body),
+        H1BatchFastPath::ParseOnly => score_dense_batch_parse_only_request_http_ack_v1(&st, body),
+    };
+
+    match outcome {
+        Ok(bin) => batch_binary_response(bin),
+        Err((status, msg)) => {
+            error!(error = %msg, "h1 batch fast path failed");
+            text_status_response(status, msg)
+        }
+    }
+}
+
+async fn serve_http1_conn(
+    stream: tokio::net::TcpStream,
+    st: AppState,
+    app: Router,
+) -> anyhow::Result<()> {
+    let svc = service_fn(move |req: http::Request<Incoming>| {
+        let st = st.clone();
+        let app = app.clone();
+        async move {
+            if let Some(fast_path) = h1_batch_fast_path(req.uri().path()) {
+                return Ok::<_, Infallible>(handle_h1_batch_fast_request(st, fast_path, req).await);
+            }
+
+            let (parts, body) = req.into_parts();
+            let req = http::Request::from_parts(parts, AxumBody::new(body));
+            let resp = app
+                .oneshot(req)
+                .await
+                .expect("axum router service is infallible");
+            Ok::<_, Infallible>(resp)
+        }
+    });
+
+    http1::Builder::new()
+        .keep_alive(true)
+        .serve_connection(TokioIo::new(stream), svc)
+        .await
+        .context("serve h1 connection")?;
+    Ok(())
 }
 
 fn encode_timings_header_value(resp: &ScoreResponse) -> Option<HeaderValue> {
@@ -636,45 +1203,55 @@ async fn handle_h2_bench_stream(
     let body = body.freeze();
 
     let outcome = match path.as_str() {
-        "/score_dense_f32_bin" => score_dense_binary_request(&st, body)
-            .await
-            .map(|(trace_id, resp)| {
-                if throughput_mode && should_sample_bench_h2(&st) {
-                    record_bench_h2_sample_metrics(&resp);
-                }
-                let bin = encode_rsk1_response(trace_id, &resp);
-                let headers: Vec<(HeaderName, HeaderValue)> = vec![(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/octet-stream"),
-                )];
-                (StatusCode::OK, headers, Bytes::from(bin))
-            }),
-        "/score_dense_f32_bin_v2" => score_dense_binary_request(&st, body)
-            .await
-            .map(|(trace_id, resp)| {
-                if throughput_mode && should_sample_bench_h2(&st) {
-                    record_bench_h2_sample_metrics(&resp);
-                }
-                let mut headers = vec![(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/octet-stream"),
-                )];
-                if !throughput_mode {
-                    if let Some(v) = encode_timings_header_value(&resp) {
-                        headers.push((HDR_RISK_TIMINGS_US, v));
+        "/score_dense_f32_bin" => {
+            score_dense_binary_request(&st, body)
+                .await
+                .map(|(trace_id, resp)| {
+                    if throughput_mode && should_sample_bench_h2(&st) {
+                        record_bench_h2_sample_metrics(&resp);
                     }
-                }
-                (StatusCode::OK, headers, Bytes::from(encode_qsb2_response(trace_id, &resp)))
-            }),
-        "/score_dense_f32_batch_v1" => score_dense_batch_binary_request_v1(&st, body, throughput_mode)
-            .await
-            .map(|bin| {
-                let headers: Vec<(HeaderName, HeaderValue)> = vec![(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/octet-stream"),
-                )];
-                (StatusCode::OK, headers, bin)
-            }),
+                    let bin = encode_rsk1_response(trace_id, &resp);
+                    let headers: Vec<(HeaderName, HeaderValue)> = vec![(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    )];
+                    (StatusCode::OK, headers, Bytes::from(bin))
+                })
+        }
+        "/score_dense_f32_bin_v2" => {
+            score_dense_binary_request(&st, body)
+                .await
+                .map(|(trace_id, resp)| {
+                    if throughput_mode && should_sample_bench_h2(&st) {
+                        record_bench_h2_sample_metrics(&resp);
+                    }
+                    let mut headers = vec![(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    )];
+                    if !throughput_mode {
+                        if let Some(v) = encode_timings_header_value(&resp) {
+                            headers.push((HDR_RISK_TIMINGS_US, v));
+                        }
+                    }
+                    (
+                        StatusCode::OK,
+                        headers,
+                        Bytes::from(encode_qsb2_response(trace_id, &resp)),
+                    )
+                })
+        }
+        "/score_dense_f32_batch_v1" => {
+            score_dense_batch_binary_request_v1(&st, body, throughput_mode)
+                .await
+                .map(|bin| {
+                    let headers: Vec<(HeaderName, HeaderValue)> = vec![(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    )];
+                    (StatusCode::OK, headers, bin)
+                })
+        }
         _ => unreachable!("path already validated"),
     };
 
@@ -692,15 +1269,14 @@ async fn handle_h2_bench_stream(
         builder = builder.header(name, value);
     }
     let response = builder.body(()).context("build h2 response")?;
-    let mut send = respond.send_response(response, false).context("send h2 headers")?;
+    let mut send = respond
+        .send_response(response, false)
+        .context("send h2 headers")?;
     send.send_data(body, true).context("send h2 body")?;
     Ok(())
 }
 
-async fn handle_h2_bench_conn(
-    stream: tokio::net::TcpStream,
-    st: AppState,
-) -> anyhow::Result<()> {
+async fn handle_h2_bench_conn(stream: tokio::net::TcpStream, st: AppState) -> anyhow::Result<()> {
     let mut conn = h2::server::handshake(stream)
         .await
         .context("h2 server handshake")?;
@@ -805,6 +1381,42 @@ async fn score_dense_f32_batch_v1(State(st): State<AppState>, body: Bytes) -> Re
     }
 }
 
+async fn score_dense_f32_batch_null_v1(State(st): State<AppState>, body: Bytes) -> Response {
+    match score_dense_batch_null_request_http_ack_v1(&st, body) {
+        Ok(bin) => {
+            let mut r = Response::new(axum::body::Body::from(bin));
+            *r.status_mut() = StatusCode::OK;
+            r.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            r
+        }
+        Err((status, msg)) => {
+            error!(error = %msg, "score_dense_f32_batch_null_v1 failed");
+            (status, msg).into_response()
+        }
+    }
+}
+
+async fn score_dense_f32_batch_parseonly_v1(State(st): State<AppState>, body: Bytes) -> Response {
+    match score_dense_batch_parse_only_request_http_ack_v1(&st, body) {
+        Ok(bin) => {
+            let mut r = Response::new(axum::body::Body::from(bin));
+            *r.status_mut() = StatusCode::OK;
+            r.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            r
+        }
+        Err((status, msg)) => {
+            error!(error = %msg, "score_dense_f32_batch_parseonly_v1 failed");
+            (status, msg).into_response()
+        }
+    }
+}
+
 async fn handle_tower_overload(err: BoxError) -> Response {
     warn!(error = %err, "request rejected by middleware");
     (StatusCode::TOO_MANY_REQUESTS, "overloaded").into_response()
@@ -893,6 +1505,14 @@ async fn async_main(
         .route("/score_dense_f32_bin", post(score_dense_f32_bin))
         .route("/score_dense_f32_bin_v2", post(score_dense_f32_bin_v2))
         .route("/score_dense_f32_batch_v1", post(score_dense_f32_batch_v1))
+        .route(
+            "/score_dense_f32_batch_null_v1",
+            post(score_dense_f32_batch_null_v1),
+        )
+        .route(
+            "/score_dense_f32_batch_parseonly_v1",
+            post(score_dense_f32_batch_parseonly_v1),
+        )
         .with_state(st.clone())
         .layer(
             ServiceBuilder::new()
@@ -921,11 +1541,17 @@ async fn async_main(
         });
     }
 
-    axum::serve(listener, app.into_make_service())
-        .await
-        .context("server failed")?;
-
-    Ok(())
+    loop {
+        let (stream, peer) = listener.accept().await.context("accept h1 connection")?;
+        stream.set_nodelay(true).ok();
+        let st2 = st.clone();
+        let app2 = app.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_http1_conn(stream, st2, app2).await {
+                warn!(peer = %peer, error = %e, "h1 connection failed");
+            }
+        });
+    }
 }
 
 fn main() -> anyhow::Result<()> {

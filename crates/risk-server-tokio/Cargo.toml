@@ -9,6 +9,9 @@ risk-quickscorer-standalone-l2 = { path = "../risk-quickscorer-standalone-l2" }
 axum = "0.7"
 bytes = "1"
 h2 = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

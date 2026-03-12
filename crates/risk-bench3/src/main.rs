@@ -20,7 +20,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::str;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
@@ -305,9 +305,7 @@ struct ThroughputResponse {
 }
 
 type H2ThroughputRespFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = (usize, u32, Result<ThroughputResponse>)> + Send,
-    >,
+    Box<dyn std::future::Future<Output = (usize, u32, Result<ThroughputResponse>)> + Send>,
 >;
 
 #[derive(Clone, Debug)]
@@ -342,6 +340,106 @@ struct ThroughputBatchDone {
     decision_counts: [u64; 5],
 }
 
+#[derive(Default)]
+struct HttpBatchWorkerStats {
+    attempted: AtomicU64,
+    dropped_conn_queue_full: AtomicU64,
+    dropped_after_attempt: AtomicU64,
+    ok: AtomicU64,
+    err: AtomicU64,
+    timeout: AtomicU64,
+    http_2xx: AtomicU64,
+    http_429: AtomicU64,
+    http_5xx: AtomicU64,
+    qsb2_samples: AtomicU64,
+    rsk1_samples: AtomicU64,
+    used_l2: AtomicU64,
+    decision_counts: [AtomicU64; 5],
+    batch_latency_us: Mutex<Vec<u64>>,
+    done: AtomicBool,
+}
+
+#[derive(Default)]
+struct HttpBatchWorkerLocal {
+    attempted: u64,
+    dropped_conn_queue_full: u64,
+    dropped_after_attempt: u64,
+    ok: u64,
+    err: u64,
+    timeout: u64,
+    http_2xx: u64,
+    http_429: u64,
+    http_5xx: u64,
+    qsb2_samples: u64,
+    rsk1_samples: u64,
+    used_l2: u64,
+    decision_counts: [u64; 5],
+    batch_latency_us: Vec<u64>,
+}
+
+impl HttpBatchWorkerLocal {
+    fn record_dropped_after_attempt(&mut self, dropped_after_attempt: u64) {
+        self.dropped_after_attempt += dropped_after_attempt;
+    }
+
+    fn record_batch(&mut self, batch: ThroughputBatchDone) {
+        self.ok += batch.ok;
+        self.err += batch.err;
+        self.timeout += batch.timeout;
+        self.http_2xx += batch.http_2xx;
+        self.http_429 += batch.http_429;
+        self.http_5xx += batch.http_5xx;
+        self.qsb2_samples += batch.qsb2_samples;
+        self.rsk1_samples += batch.rsk1_samples;
+        self.used_l2 += batch.used_l2;
+        for (dst, src) in self
+            .decision_counts
+            .iter_mut()
+            .zip(batch.decision_counts.into_iter())
+        {
+            *dst += src;
+        }
+        self.batch_latency_us.push(batch.latency_us.max(1));
+    }
+
+    fn flush_into(&mut self, shared: &HttpBatchWorkerStats) {
+        shared
+            .attempted
+            .fetch_add(self.attempted, Ordering::Relaxed);
+        shared
+            .dropped_conn_queue_full
+            .fetch_add(self.dropped_conn_queue_full, Ordering::Relaxed);
+        shared
+            .dropped_after_attempt
+            .fetch_add(self.dropped_after_attempt, Ordering::Relaxed);
+        shared.ok.fetch_add(self.ok, Ordering::Relaxed);
+        shared.err.fetch_add(self.err, Ordering::Relaxed);
+        shared.timeout.fetch_add(self.timeout, Ordering::Relaxed);
+        shared.http_2xx.fetch_add(self.http_2xx, Ordering::Relaxed);
+        shared.http_429.fetch_add(self.http_429, Ordering::Relaxed);
+        shared.http_5xx.fetch_add(self.http_5xx, Ordering::Relaxed);
+        shared
+            .qsb2_samples
+            .fetch_add(self.qsb2_samples, Ordering::Relaxed);
+        shared
+            .rsk1_samples
+            .fetch_add(self.rsk1_samples, Ordering::Relaxed);
+        shared.used_l2.fetch_add(self.used_l2, Ordering::Relaxed);
+        for (dst, src) in shared
+            .decision_counts
+            .iter()
+            .zip(self.decision_counts.iter())
+        {
+            dst.fetch_add(*src, Ordering::Relaxed);
+        }
+        if !self.batch_latency_us.is_empty() {
+            let mut lat = shared.batch_latency_us.lock().expect("batch latency mutex");
+            lat.extend(self.batch_latency_us.drain(..));
+        }
+        *self = Self::default();
+    }
+}
+
 #[derive(Debug)]
 enum AggEvent {
     AttemptBatch {
@@ -353,6 +451,9 @@ enum AggEvent {
     },
     ThroughputBatch {
         batch: ThroughputBatchDone,
+    },
+    ThroughputBatches {
+        items: Vec<ThroughputBatchDone>,
     },
     WorkerDone,
 }
@@ -509,7 +610,10 @@ impl WorkloadSource {
 
     fn build_body(&self, seq: u64, worker_id: usize) -> Bytes {
         match self {
-            WorkloadSource::Corpus { payload, route_meta } => {
+            WorkloadSource::Corpus {
+                payload,
+                route_meta,
+            } => {
                 let row_idx =
                     (((seq as usize).wrapping_mul(1_315_423_911)) ^ worker_id) % payload.rows;
                 build_payload_bytes(payload, route_meta.as_ref(), row_idx)
@@ -528,7 +632,10 @@ fn load_workload_source(args: &Args) -> Result<WorkloadSource> {
             } else {
                 None
             };
-            Ok(WorkloadSource::Corpus { payload, route_meta })
+            Ok(WorkloadSource::Corpus {
+                payload,
+                route_meta,
+            })
         }
         WorkloadMode::Ceiling => {
             let path = args
@@ -680,32 +787,68 @@ impl ResponseParser {
         }
     }
 
+    fn read_batch_ack_from(
+        &mut self,
+        stream: &mut TcpStream,
+    ) -> io::Result<Option<(HttpResponseMeta, BatchAck)>> {
+        let mut tmp = [0u8; 4096];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "server closed connection",
+                    ))
+                }
+                Ok(n) => {
+                    self.buf.extend_from_slice(&tmp[..n]);
+                    if self.buf.len() > MAX_RESPONSE_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "response too large",
+                        ));
+                    }
+                    if let Some(done) = self.try_finish_batch_ack()? {
+                        return Ok(Some(done));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn parse_headers_generic(&mut self, header_bytes: &[u8]) -> io::Result<()> {
+        let header_str = str::from_utf8(header_bytes).map_err(invalid_data)?;
+        let mut lines = header_str.split("\r\n");
+        let status_line = lines
+            .next()
+            .ok_or_else(|| invalid_data("missing status line"))?;
+        self.status_code = parse_status_code(status_line)?;
+        self.content_len = 0;
+        self.timings_header = None;
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                let value = value.trim();
+                if name.eq_ignore_ascii_case("content-length") {
+                    self.content_len = value
+                        .parse::<usize>()
+                        .map_err(|e| invalid_data(e.to_string()))?;
+                } else if name.eq_ignore_ascii_case("x-risk-timings-us") {
+                    self.timings_header = decode_timings_csv(value);
+                }
+            }
+        }
+        self.headers_parsed = true;
+        Ok(())
+    }
+
     fn try_finish(&mut self) -> io::Result<Option<(HttpResponseMeta, BodyDecoded)>> {
         if !self.headers_parsed {
             if let Some(hdr_end) = find_subsequence(&self.buf, b"\r\n\r\n") {
                 self.header_len = hdr_end + 4;
-                let header_bytes = &self.buf[..hdr_end];
-                let header_str = str::from_utf8(header_bytes).map_err(invalid_data)?;
-                let mut lines = header_str.split("\r\n");
-                let status_line = lines
-                    .next()
-                    .ok_or_else(|| invalid_data("missing status line"))?;
-                self.status_code = parse_status_code(status_line)?;
-                self.content_len = 0;
-                self.timings_header = None;
-                for line in lines {
-                    if let Some((name, value)) = line.split_once(':') {
-                        let value = value.trim();
-                        if name.eq_ignore_ascii_case("content-length") {
-                            self.content_len = value
-                                .parse::<usize>()
-                                .map_err(|e| invalid_data(e.to_string()))?;
-                        } else if name.eq_ignore_ascii_case("x-risk-timings-us") {
-                            self.timings_header = decode_timings_csv(value);
-                        }
-                    }
-                }
-                self.headers_parsed = true;
+                let header_bytes = self.buf[..hdr_end].to_vec();
+                self.parse_headers_generic(&header_bytes)?;
             } else {
                 return Ok(None);
             }
@@ -721,6 +864,45 @@ impl ResponseParser {
             return Ok(Some((meta, decoded)));
         }
         Ok(None)
+    }
+
+    fn try_finish_batch_ack(&mut self) -> io::Result<Option<(HttpResponseMeta, BatchAck)>> {
+        if !self.headers_parsed {
+            if let Some(hdr_end) = find_subsequence(&self.buf, b"\r\n\r\n") {
+                self.header_len = hdr_end + 4;
+                let header_bytes = &self.buf[..hdr_end];
+                if let Some((status_code, content_len)) =
+                    parse_batch_ack_headers_fast(header_bytes)?
+                {
+                    self.status_code = status_code;
+                    self.content_len = content_len;
+                    self.timings_header = None;
+                    self.headers_parsed = true;
+                } else {
+                    let header_bytes = header_bytes.to_vec();
+                    self.parse_headers_generic(&header_bytes)?;
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+
+        if self.headers_parsed && self.buf.len() >= self.header_len + self.content_len {
+            let meta = HttpResponseMeta {
+                status_code: self.status_code,
+                timings_header: None,
+            };
+            let body = &self.buf[self.header_len..self.header_len + self.content_len];
+            if let Some(ack) = decode_batch_ack_body(body) {
+                return Ok(Some((meta, ack)));
+            }
+            match decode_body(body)? {
+                BodyDecoded::BatchAck(ack) => Ok(Some((meta, ack))),
+                _ => Err(invalid_data("expected batch ack response")),
+            }
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -762,11 +944,13 @@ impl Default for BatchWriteState {
 }
 
 struct BatchActiveReq {
+    start_row_idx: usize,
     t_sched: Instant,
     deadline: Instant,
     record: bool,
     rows: u32,
-    body: Bytes,
+    batch_records: usize,
+    batch_header: [u8; 16],
 }
 
 struct BatchConn {
@@ -785,11 +969,7 @@ impl BatchConn {
     }
 }
 
-fn discard_batch_rows(
-    tx: &Sender<AggEvent>,
-    local_pending: &mut VecDeque<QueuedReq>,
-    conns: &mut [BatchConn],
-) {
+fn discard_batch_rows(local_pending: &mut VecDeque<QueuedReq>, conns: &mut [BatchConn]) -> u64 {
     let mut dropped_rows = 0u64;
     while let Some(req) = local_pending.pop_front() {
         if req.record {
@@ -803,12 +983,7 @@ fn discard_batch_rows(
             }
         }
     }
-    if dropped_rows > 0 {
-        let _ = tx.send(AggEvent::AttemptBatch {
-            attempted: 0,
-            dropped_conn_queue_full: dropped_rows,
-        });
-    }
+    dropped_rows
 }
 
 struct StatsAgg {
@@ -819,6 +994,7 @@ struct StatsAgg {
     dropped: u64,
     drop_inflight_cap: u64,
     drop_conn_queue_full: u64,
+    dropped_after_attempt: u64,
     http_2xx: u64,
     http_429: u64,
     http_5xx: u64,
@@ -849,6 +1025,7 @@ impl StatsAgg {
             dropped: 0,
             drop_inflight_cap: 0,
             drop_conn_queue_full: 0,
+            dropped_after_attempt: 0,
             http_2xx: 0,
             http_429: 0,
             http_5xx: 0,
@@ -874,6 +1051,11 @@ impl StatsAgg {
         self.attempted += attempted;
         self.dropped += dropped_conn_queue_full;
         self.drop_conn_queue_full += dropped_conn_queue_full;
+    }
+
+    fn record_dropped_after_attempt(&mut self, dropped_after_attempt: u64) {
+        self.dropped += dropped_after_attempt;
+        self.dropped_after_attempt += dropped_after_attempt;
     }
 
     fn record_completion(&mut self, item: &CompletedSample) {
@@ -992,6 +1174,7 @@ struct SummaryConfig {
 
 #[derive(Serialize)]
 struct SummaryCounts {
+    offered: u64,
     attempted: u64,
     ok: u64,
     err: u64,
@@ -999,6 +1182,7 @@ struct SummaryCounts {
     dropped: u64,
     drop_inflight_cap: u64,
     drop_conn_queue_full: u64,
+    dropped_after_attempt: u64,
     http_2xx: u64,
     http_429: u64,
     http_5xx: u64,
@@ -1012,6 +1196,12 @@ struct SummaryCounts {
     decision_unknown: u64,
     attempted_rps: f64,
     ok_rps: f64,
+    target_rps: u64,
+    offered_but_not_sent: u64,
+    offered_but_not_sent_rps: f64,
+    offered_but_not_sent_pct: f64,
+    under_target_rps: f64,
+    under_target_pct: f64,
     attempted_batch_rps: f64,
     ok_batch_rps: f64,
 }
@@ -1087,21 +1277,85 @@ fn decode_timings_csv(s: &str) -> Option<StageTimingsUs> {
     })
 }
 
-fn decode_body(buf: &[u8]) -> io::Result<BodyDecoded> {
-    if buf.len() == 40 && &buf[0..4] == b"RBA1" {
-        let version = u16::from_le_bytes([buf[4], buf[5]]);
-        if version != 1 {
-            return Err(invalid_data(format!("unsupported RBA1 version: {version}")));
+fn trim_ascii_ws(mut bytes: &[u8]) -> &[u8] {
+    while let Some((&b, rest)) = bytes.split_first() {
+        if matches!(b, b' ' | b'\t' | b'\r') {
+            bytes = rest;
+        } else {
+            break;
         }
-        let rd = |off: usize| -> u32 {
-            u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-        };
-        return Ok(BodyDecoded::BatchAck(BatchAck {
-            record_count: rd(8),
-            ok_count: rd(12),
-            used_l2_count: rd(16),
-            decision_counts: [rd(20), rd(24), rd(28), rd(32), rd(36)],
-        }));
+    }
+    while let Some((&b, rest)) = bytes.split_last() {
+        if matches!(b, b' ' | b'\t' | b'\r') {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
+fn starts_with_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack[..needle.len()]
+            .iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn parse_batch_ack_headers_fast(header_bytes: &[u8]) -> io::Result<Option<(u16, usize)>> {
+    let mut lines = header_bytes.split(|&b| b == b'\n');
+    let status_line = trim_ascii_ws(
+        lines
+            .next()
+            .ok_or_else(|| invalid_data("missing status line"))?,
+    );
+    if status_line.len() < 12 || !status_line.starts_with(b"HTTP/1.") || status_line[8] != b' ' {
+        return Ok(None);
+    }
+    let code = std::str::from_utf8(&status_line[9..12])
+        .map_err(invalid_data)?
+        .parse::<u16>()
+        .map_err(invalid_data)?;
+    let mut content_len = None;
+    for line in lines {
+        let line = trim_ascii_ws(line);
+        if starts_with_ascii_case_insensitive(line, b"content-length:") {
+            let value = trim_ascii_ws(&line["content-length:".len()..]);
+            content_len = Some(
+                std::str::from_utf8(value)
+                    .map_err(invalid_data)?
+                    .parse::<usize>()
+                    .map_err(invalid_data)?,
+            );
+            break;
+        }
+    }
+    Ok(content_len.map(|len| (code, len)))
+}
+
+fn decode_batch_ack_body(buf: &[u8]) -> Option<BatchAck> {
+    if buf.len() != 40 || &buf[0..4] != b"RBA1" {
+        return None;
+    }
+    let version = u16::from_le_bytes([buf[4], buf[5]]);
+    if version != 1 {
+        return None;
+    }
+    let rd = |off: usize| -> u32 {
+        u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    };
+    Some(BatchAck {
+        record_count: rd(8),
+        ok_count: rd(12),
+        used_l2_count: rd(16),
+        decision_counts: [rd(20), rd(24), rd(28), rd(32), rd(36)],
+    })
+}
+
+fn decode_body(buf: &[u8]) -> io::Result<BodyDecoded> {
+    if let Some(ack) = decode_batch_ack_body(buf) {
+        return Ok(BodyDecoded::BatchAck(ack));
     }
     if buf.len() == 24 && &buf[0..4] == b"QSB2" {
         return Ok(BodyDecoded::Qsb2(Qsb2 {
@@ -1328,10 +1582,7 @@ fn build_timeout(active: &ActiveReq, now: Instant) -> CompletedSample {
     }
 }
 
-fn throughput_response_from_decoded(
-    status_code: u16,
-    body: BodyDecoded,
-) -> ThroughputResponse {
+fn throughput_response_from_decoded(status_code: u16, body: BodyDecoded) -> ThroughputResponse {
     match body {
         BodyDecoded::Qsb2(q) => {
             let mut decision_counts = [0u32; 5];
@@ -1411,7 +1662,7 @@ fn update_throughput_batch(state: &mut ThroughputBatchState, resp: ThroughputRes
 }
 
 fn maybe_finalize_throughput_batch(
-    tx: &Sender<AggEvent>,
+    out: &mut Vec<ThroughputBatchDone>,
     batch_id: u64,
     now: Instant,
     batches: &mut HashMap<u64, ThroughputBatchState>,
@@ -1424,22 +1675,33 @@ fn maybe_finalize_throughput_batch(
         return;
     }
     if let Some(batch) = batches.remove(&batch_id) {
-        let _ = tx.send(AggEvent::ThroughputBatch {
-            batch: ThroughputBatchDone {
-                latency_us: now.duration_since(batch.issued_at).as_micros() as u64,
-                ok: batch.ok,
-                err: batch.err,
-                timeout: batch.timeout,
-                http_2xx: batch.http_2xx,
-                http_429: batch.http_429,
-                http_5xx: batch.http_5xx,
-                qsb2_samples: batch.qsb2_samples,
-                rsk1_samples: batch.rsk1_samples,
-                used_l2: batch.used_l2,
-                decision_counts: batch.decision_counts,
-            },
+        out.push(ThroughputBatchDone {
+            latency_us: now.duration_since(batch.issued_at).as_micros() as u64,
+            ok: batch.ok,
+            err: batch.err,
+            timeout: batch.timeout,
+            http_2xx: batch.http_2xx,
+            http_429: batch.http_429,
+            http_5xx: batch.http_5xx,
+            qsb2_samples: batch.qsb2_samples,
+            rsk1_samples: batch.rsk1_samples,
+            used_l2: batch.used_l2,
+            decision_counts: batch.decision_counts,
         });
     }
+}
+
+fn maybe_flush_throughput_batches(tx: &Sender<AggEvent>, items: &mut Vec<ThroughputBatchDone>) {
+    if items.is_empty() {
+        return;
+    }
+    if items.len() == 1 {
+        let batch = items.pop().expect("one throughput batch");
+        let _ = tx.send(AggEvent::ThroughputBatch { batch });
+        return;
+    }
+    let flushed = std::mem::take(items);
+    let _ = tx.send(AggEvent::ThroughputBatches { items: flushed });
 }
 
 fn take_quota(quota: &AtomicU64, max_take: usize) -> usize {
@@ -1453,12 +1715,7 @@ fn take_quota(quota: &AtomicU64, max_take: usize) -> usize {
             return 0;
         }
         let take = cur.min(max_take);
-        match quota.compare_exchange_weak(
-            cur,
-            cur - take,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match quota.compare_exchange_weak(cur, cur - take, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return take as usize,
             Err(next) => cur = next,
         }
@@ -1487,32 +1744,15 @@ fn record_len(corpus: &PayloadCorpus, route_meta: Option<&RouteMetaCorpus>) -> u
     corpus.row_bytes + route_meta.map(|_| 40).unwrap_or(0)
 }
 
-fn build_batch_payload_bytes(
-    corpus: &PayloadCorpus,
-    route_meta: Option<&RouteMetaCorpus>,
-    start_row_idx: usize,
-    batch_records: usize,
-) -> Bytes {
-    let batch_records = batch_records.max(1);
-    let rec_len = record_len(corpus, route_meta);
-    let mut out = Vec::with_capacity(16 + rec_len * batch_records);
-    out.extend_from_slice(b"RBH1");
-    out.extend_from_slice(&1u16.to_le_bytes());
-    let flags = if route_meta.is_some() { 1u16 } else { 0u16 };
-    out.extend_from_slice(&flags.to_le_bytes());
-    out.extend_from_slice(&(batch_records as u32).to_le_bytes());
-    out.extend_from_slice(&(rec_len as u32).to_le_bytes());
-    for i in 0..batch_records {
-        let row_idx = (start_row_idx + i) % corpus.rows;
-        if let Some(route_meta) = route_meta {
-            out.extend_from_slice(&encode_rvec_v3_route_header(
-                route_meta.row(row_idx),
-                corpus.row_bytes / 4,
-            ));
-        }
-        out.extend_from_slice(corpus.row_slice(row_idx));
-    }
-    Bytes::from(out)
+fn encode_batch_header(record_count: usize, record_bytes: usize, has_route_meta: bool) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(b"RBH1");
+    out[4..6].copy_from_slice(&1u16.to_le_bytes());
+    let flags = if has_route_meta { 1u16 } else { 0u16 };
+    out[6..8].copy_from_slice(&flags.to_le_bytes());
+    out[8..12].copy_from_slice(&(record_count as u32).to_le_bytes());
+    out[12..16].copy_from_slice(&(record_bytes as u32).to_le_bytes());
+    out
 }
 
 async fn connect_h2_stream(addr: SocketAddr) -> Result<tokio::net::TcpStream> {
@@ -1798,10 +2038,7 @@ async fn worker_loop_h2c_async(
             let request_id = next_request_id;
             next_request_id = next_request_id.wrapping_add(1);
             if cmd_txs[conn_idx]
-                .send(H2SendCmd {
-                    request_id,
-                    body,
-                })
+                .send(H2SendCmd { request_id, body })
                 .is_err()
             {
                 if active.record {
@@ -1809,10 +2046,7 @@ async fn worker_loop_h2c_async(
                 }
                 continue;
             }
-            inflight.insert(
-                request_id,
-                H2InflightReq { active, conn_idx },
-            );
+            inflight.insert(request_id, H2InflightReq { active, conn_idx });
             inflight_counts[conn_idx] += 1;
         }
 
@@ -1939,6 +2173,8 @@ async fn worker_loop_h2c_throughput_async(
     let batch_size = args.throughput_batch_size.max(1);
     let mut batches = HashMap::<u64, ThroughputBatchState>::new();
     let mut drain_started: Option<Instant> = None;
+    let mut batch_flush = Vec::with_capacity(32);
+    let mut last_batch_flush = Instant::now();
 
     loop {
         let local_total = local_warmup_tokens + local_record_tokens;
@@ -1960,10 +2196,17 @@ async fn worker_loop_h2c_throughput_async(
                     if let Some(batch) = batches.get_mut(&batch_id) {
                         match result {
                             Ok(response) => update_throughput_batch(batch, response),
-                            Err(_) => update_throughput_batch(batch, throughput_timeout_response(1)),
+                            Err(_) => {
+                                update_throughput_batch(batch, throughput_timeout_response(1))
+                            }
                         }
                     }
-                    maybe_finalize_throughput_batch(&events_tx, batch_id, Instant::now(), &mut batches);
+                    maybe_finalize_throughput_batch(
+                        &mut batch_flush,
+                        batch_id,
+                        Instant::now(),
+                        &mut batches,
+                    );
                 }
             }
             let _ = conn_idx;
@@ -2060,7 +2303,7 @@ async fn worker_loop_h2c_throughput_async(
                             update_throughput_batch(batch, throughput_timeout_response(1));
                         }
                         maybe_finalize_throughput_batch(
-                            &events_tx,
+                            &mut batch_flush,
                             batch_id,
                             Instant::now(),
                             &mut batches,
@@ -2078,7 +2321,7 @@ async fn worker_loop_h2c_throughput_async(
                             update_throughput_batch(batch, throughput_timeout_response(1));
                         }
                         maybe_finalize_throughput_batch(
-                            &events_tx,
+                            &mut batch_flush,
                             batch_id,
                             Instant::now(),
                             &mut batches,
@@ -2094,7 +2337,7 @@ async fn worker_loop_h2c_throughput_async(
                         update_throughput_batch(batch, throughput_timeout_response(1));
                     }
                     maybe_finalize_throughput_batch(
-                        &events_tx,
+                        &mut batch_flush,
                         batch_id,
                         Instant::now(),
                         &mut batches,
@@ -2133,13 +2376,13 @@ async fn worker_loop_h2c_throughput_async(
                     if let Some(batch) = batches.get_mut(&batch_id) {
                         update_throughput_batch(batch, throughput_timeout_response(1));
                     }
-                    maybe_finalize_throughput_batch(&events_tx, batch_id, now, &mut batches);
+                    maybe_finalize_throughput_batch(&mut batch_flush, batch_id, now, &mut batches);
                 }
             }
         }
 
-        let quota_empty = quota.warmup.load(Ordering::Acquire) == 0
-            && quota.record.load(Ordering::Acquire) == 0;
+        let quota_empty =
+            quota.warmup.load(Ordering::Acquire) == 0 && quota.record.load(Ordering::Acquire) == 0;
         let all_idle = quota_empty
             && local_warmup_tokens == 0
             && local_record_tokens == 0
@@ -2166,7 +2409,7 @@ async fn worker_loop_h2c_throughput_async(
                                 update_throughput_batch(batch, throughput_timeout_response(1));
                             }
                             maybe_finalize_throughput_batch(
-                                &events_tx,
+                                &mut batch_flush,
                                 batch_id,
                                 now,
                                 &mut batches,
@@ -2189,11 +2432,13 @@ async fn worker_loop_h2c_throughput_async(
                     if let Some(batch) = batches.get_mut(&batch_id) {
                         match result {
                             Ok(response) => update_throughput_batch(batch, response),
-                            Err(_) => update_throughput_batch(batch, throughput_timeout_response(1)),
+                            Err(_) => {
+                                update_throughput_batch(batch, throughput_timeout_response(1))
+                            }
                         }
                     }
                     maybe_finalize_throughput_batch(
-                        &events_tx,
+                        &mut batch_flush,
                         batch_id,
                         Instant::now(),
                         &mut batches,
@@ -2201,13 +2446,18 @@ async fn worker_loop_h2c_throughput_async(
                 }
             }
         }
+
+        if batch_flush.len() >= 32 || last_batch_flush.elapsed() >= Duration::from_millis(2) {
+            maybe_flush_throughput_batches(&events_tx, &mut batch_flush);
+            last_batch_flush = Instant::now();
+        }
     }
 
     if let Some(batch_id) = open_batch_id.take() {
         if let Some(batch) = batches.get_mut(&batch_id) {
             batch.sealed = true;
         }
-        maybe_finalize_throughput_batch(&events_tx, batch_id, Instant::now(), &mut batches);
+        maybe_finalize_throughput_batch(&mut batch_flush, batch_id, Instant::now(), &mut batches);
     }
 
     let remaining_batch_ids: Vec<u64> = batches.keys().copied().collect();
@@ -2215,8 +2465,9 @@ async fn worker_loop_h2c_throughput_async(
         if let Some(batch) = batches.get_mut(&batch_id) {
             batch.sealed = true;
         }
-        maybe_finalize_throughput_batch(&events_tx, batch_id, Instant::now(), &mut batches);
+        maybe_finalize_throughput_batch(&mut batch_flush, batch_id, Instant::now(), &mut batches);
     }
+    maybe_flush_throughput_batches(&events_tx, &mut batch_flush);
 
     Ok(())
 }
@@ -2235,7 +2486,10 @@ fn worker_loop_h2c(
 ) -> Result<()> {
     pin_current_thread(cpu)?;
     if args.progress {
-        eprintln!("[bench3] worker={} start cpu={:?} transport=h2c", worker_id, cpu);
+        eprintln!(
+            "[bench3] worker={} start cpu={:?} transport=h2c",
+            worker_id, cpu
+        );
     }
     let rt = TokioRuntimeBuilder::new_current_thread()
         .enable_all()
@@ -2244,20 +2498,16 @@ fn worker_loop_h2c(
     match args.mode {
         BenchMode::Latency => {
             let (corpus, route_meta) = match workload {
-                WorkloadSource::Corpus { payload, route_meta } => (payload, route_meta),
+                WorkloadSource::Corpus {
+                    payload,
+                    route_meta,
+                } => (payload, route_meta),
                 WorkloadSource::Ceiling { .. } => {
                     bail!("latency mode requires --workload corpus")
                 }
             };
             rt.block_on(worker_loop_h2c_async(
-                worker_id,
-                args,
-                target,
-                corpus,
-                route_meta,
-                queue,
-                events_tx,
-                pacer_done,
+                worker_id, args, target, corpus, route_meta, queue, events_tx, pacer_done,
             ))
         }
         BenchMode::Throughput => rt.block_on(worker_loop_h2c_throughput_async(
@@ -2414,27 +2664,89 @@ fn reconnect_batch_conn(conn: &mut BatchConn, poll: &Poll, target: &Target) -> R
     Ok(())
 }
 
-fn flush_write_batch(conn: &mut BatchConn, req_tpl: &RequestTemplate) -> io::Result<bool> {
+fn flush_write_batch(
+    conn: &mut BatchConn,
+    req_tpl: &RequestTemplate,
+    corpus: &PayloadCorpus,
+    route_meta: Option<&RouteMetaCorpus>,
+) -> io::Result<bool> {
     let Some(active) = conn.active.as_ref() else {
         return Ok(true);
     };
     let prefix = req_tpl.prefix.as_slice();
-    let body = active.body.as_ref();
     let prefix_rem = &prefix[conn.write_state.prefix_off..];
-    let body_rem = &body[conn.write_state.body_off..];
-    let bufs = [IoSlice::new(prefix_rem), IoSlice::new(body_rem)];
+    let rec_len = record_len(corpus, route_meta);
+    let total_body_len = 16 + rec_len * active.batch_records;
+    let mut body_off = conn.write_state.body_off.min(total_body_len);
+    let mut route_headers = [[0u8; 40]; 128];
+    let mut bufs = Vec::with_capacity(2 + active.batch_records.saturating_mul(2));
+    if !prefix_rem.is_empty() {
+        bufs.push(IoSlice::new(prefix_rem));
+    }
+    if body_off < 16 {
+        bufs.push(IoSlice::new(&active.batch_header[body_off..]));
+        body_off = 0;
+    } else {
+        body_off -= 16;
+    }
+
+    let start_record = body_off / rec_len.max(1);
+    let first_record_off = body_off % rec_len.max(1);
+    if let Some(route_meta) = route_meta {
+        let dim = corpus.row_bytes / 4;
+        for (record_idx, header) in route_headers
+            .iter_mut()
+            .enumerate()
+            .take(active.batch_records)
+        {
+            let row_idx = (active.start_row_idx + record_idx) % corpus.rows;
+            *header = encode_rvec_v3_route_header(route_meta.row(row_idx), dim);
+        }
+        for record_idx in start_record..active.batch_records {
+            let row_idx = (active.start_row_idx + record_idx) % corpus.rows;
+            let mut rec_off = if record_idx == start_record {
+                first_record_off
+            } else {
+                0
+            };
+            if rec_off < 40 {
+                bufs.push(IoSlice::new(&route_headers[record_idx][rec_off..]));
+                rec_off = 0;
+            } else {
+                rec_off -= 40;
+            }
+            let row = corpus.row_slice(row_idx);
+            bufs.push(IoSlice::new(&row[rec_off..]));
+        }
+    } else {
+        for record_idx in start_record..active.batch_records {
+            let row_idx = (active.start_row_idx + record_idx) % corpus.rows;
+            let rec_off = if record_idx == start_record {
+                first_record_off
+            } else {
+                0
+            };
+            let row = corpus.row_slice(row_idx);
+            bufs.push(IoSlice::new(&row[rec_off..]));
+        }
+    }
+
     let wrote = conn.stream.write_vectored(&bufs)?;
+    if wrote == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "socket write returned 0",
+        ));
+    }
 
     let mut left = wrote;
     let take_prefix = left.min(prefix_rem.len());
     conn.write_state.prefix_off += take_prefix;
     left -= take_prefix;
-    let take_body = left.min(body_rem.len());
+    let take_body = left.min(total_body_len.saturating_sub(conn.write_state.body_off));
     conn.write_state.body_off += take_body;
 
-    Ok(
-        conn.write_state.prefix_off >= prefix.len() && conn.write_state.body_off >= body.len(),
-    )
+    Ok(conn.write_state.prefix_off >= prefix.len() && conn.write_state.body_off >= total_body_len)
 }
 
 fn start_next_send_batch(
@@ -2452,13 +2764,20 @@ fn start_next_send_batch(
         return Ok(());
     };
     let rows = next.rows.max(1) as usize;
-    let body = build_batch_payload_bytes(corpus, route_meta, next.row_idx, rows.min(batch_records.max(1)));
+    let batch_records = rows.min(batch_records.max(1));
+    let batch_header = encode_batch_header(
+        batch_records,
+        record_len(corpus, route_meta),
+        route_meta.is_some(),
+    );
     conn.active = Some(BatchActiveReq {
+        start_row_idx: next.row_idx,
         t_sched: next.t_sched,
         deadline: Instant::now() + timeout,
         record: next.record,
-        rows: next.rows.max(1),
-        body,
+        rows: batch_records as u32,
+        batch_records,
+        batch_header,
     });
     conn.write_state = BatchWriteState::default();
     conn.reading = false;
@@ -2511,7 +2830,10 @@ fn throughput_done_from_batch_ack(
     }
 }
 
-fn throughput_done_from_batch_timeout(active: &BatchActiveReq, now: Instant) -> ThroughputBatchDone {
+fn throughput_done_from_batch_timeout(
+    active: &BatchActiveReq,
+    now: Instant,
+) -> ThroughputBatchDone {
     ThroughputBatchDone {
         latency_us: now.duration_since(active.t_sched).as_micros() as u64,
         ok: 0,
@@ -2741,12 +3063,15 @@ fn worker_loop_http_batch(
     route_meta: Option<RouteMetaCorpus>,
     req_tpl: RequestTemplate,
     queue: Arc<ArrayQueue<ReqToken>>,
-    events_tx: Sender<AggEvent>,
+    shared_stats: Arc<HttpBatchWorkerStats>,
     pacer_done: Arc<AtomicBool>,
 ) -> Result<()> {
     pin_current_thread(cpu)?;
     if args.progress {
-        eprintln!("[bench3] worker={} start cpu={:?} transport=http1-batch", worker_id, cpu);
+        eprintln!(
+            "[bench3] worker={} start cpu={:?} transport=http1-batch",
+            worker_id, cpu
+        );
     }
     let mut poll = Poll::new().context("mio poll")?;
     let mut events = Events::with_capacity(1024);
@@ -2775,6 +3100,8 @@ fn worker_loop_http_batch(
     );
     let mut next_conn_rr = worker_id % args.conns_per_worker.max(1);
     let mut drain_started: Option<Instant> = None;
+    let mut local_stats = HttpBatchWorkerLocal::default();
+    let mut last_local_flush = Instant::now();
 
     loop {
         let pacing_done = pacer_done.load(Ordering::Acquire);
@@ -2824,9 +3151,8 @@ fn worker_loop_http_batch(
                     reconnect_batch_conn(conn, &poll, &target)?;
                     if let Some(active) = active {
                         if active.record {
-                            let _ = events_tx.send(AggEvent::ThroughputBatch {
-                                batch: throughput_done_from_batch_timeout(&active, now),
-                            });
+                            local_stats
+                                .record_batch(throughput_done_from_batch_timeout(&active, now));
                         }
                     }
                     start_next_send_batch(
@@ -2854,13 +3180,15 @@ fn worker_loop_http_batch(
             let started = drain_started.get_or_insert_with(Instant::now);
             if started.elapsed() >= timeout + Duration::from_millis(100) {
                 let now = Instant::now();
-                discard_batch_rows(&events_tx, &mut local_pending, &mut conns);
+                local_stats.record_dropped_after_attempt(discard_batch_rows(
+                    &mut local_pending,
+                    &mut conns,
+                ));
                 for conn in &mut conns {
                     if let Some(active) = conn.active.take() {
                         if active.record {
-                            let _ = events_tx.send(AggEvent::ThroughputBatch {
-                                batch: throughput_done_from_batch_timeout(&active, now),
-                            });
+                            local_stats
+                                .record_batch(throughput_done_from_batch_timeout(&active, now));
                         }
                     }
                     conn.reading = false;
@@ -2882,7 +3210,7 @@ fn worker_loop_http_batch(
             }
             let conn = &mut conns[idx];
             if ev.is_writable() && conn.active.is_some() {
-                match flush_write_batch(conn, &req_tpl) {
+                match flush_write_batch(conn, &req_tpl, &corpus, route_meta.as_ref()) {
                     Ok(true) => {
                         if let Some(active) = conn.active.as_mut() {
                             active.deadline = Instant::now() + timeout;
@@ -2898,12 +3226,10 @@ fn worker_loop_http_batch(
                         reconnect_batch_conn(conn, &poll, &target)?;
                         if let Some(active) = active {
                             if active.record {
-                                let _ = events_tx.send(AggEvent::ThroughputBatch {
-                                    batch: throughput_done_from_batch_timeout(
-                                        &active,
-                                        Instant::now(),
-                                    ),
-                                });
+                                local_stats.record_batch(throughput_done_from_batch_timeout(
+                                    &active,
+                                    Instant::now(),
+                                ));
                             }
                         }
                         start_next_send_batch(
@@ -2919,18 +3245,14 @@ fn worker_loop_http_batch(
             }
 
             if ev.is_readable() && conn.reading {
-                match conn.parser.read_from(&mut conn.stream) {
-                    Ok(Some((meta, body))) => {
+                match conn.parser.read_batch_ack_from(&mut conn.stream) {
+                    Ok(Some((meta, ack))) => {
                         let done_at = Instant::now();
                         if let Some(active) = conn.active.take() {
                             if active.record {
-                                let batch = match body {
-                                    BodyDecoded::BatchAck(ack) => {
-                                        throughput_done_from_batch_ack(&active, done_at, meta, ack)
-                                    }
-                                    _ => throughput_done_from_batch_timeout(&active, done_at),
-                                };
-                                let _ = events_tx.send(AggEvent::ThroughputBatch { batch });
+                                let batch =
+                                    throughput_done_from_batch_ack(&active, done_at, meta, ack);
+                                local_stats.record_batch(batch);
                             }
                         }
                         conn.parser.reset();
@@ -2951,12 +3273,10 @@ fn worker_loop_http_batch(
                         reconnect_batch_conn(conn, &poll, &target)?;
                         if let Some(active) = active {
                             if active.record {
-                                let _ = events_tx.send(AggEvent::ThroughputBatch {
-                                    batch: throughput_done_from_batch_timeout(
-                                        &active,
-                                        Instant::now(),
-                                    ),
-                                });
+                                local_stats.record_batch(throughput_done_from_batch_timeout(
+                                    &active,
+                                    Instant::now(),
+                                ));
                             }
                         }
                         start_next_send_batch(
@@ -2971,7 +3291,14 @@ fn worker_loop_http_batch(
                 }
             }
         }
+
+        if last_local_flush.elapsed() >= Duration::from_millis(100) {
+            local_stats.flush_into(&shared_stats);
+            last_local_flush = Instant::now();
+        }
     }
+    local_stats.flush_into(&shared_stats);
+    shared_stats.done.store(true, Ordering::Release);
     if args.progress {
         eprintln!("[bench3] worker={} done transport=http1-batch", worker_id);
     }
@@ -3015,6 +3342,81 @@ fn pacer_loop(
             "[bench3] pacer start cpu={:?} rps={} warmup={}s duration={}s",
             args.pacer_cpu, args.rps, args.warmup, args.duration
         );
+    }
+    if args.batch_mode == BatchMode::Http1 {
+        let start = Instant::now();
+        let warmup_end = start + Duration::from_secs(args.warmup);
+        let end = start + Duration::from_secs(args.warmup + args.duration);
+        let epoch_us = 100u64;
+        let mut next_at = start;
+        let rows_per_token = args.batch_records.max(1) as u64;
+        let target_tokens_per_sec = (args.rps.max(1) as f64 / rows_per_token as f64).max(1.0);
+        let tokens_per_epoch = target_tokens_per_sec * (epoch_us as f64 / 1_000_000.0);
+        let mut token_carry = 0.0f64;
+        let mut rr = 0usize;
+        let mut attempted_rows = 0u64;
+        let mut dropped_rows = 0u64;
+        let mut req_id = 0u64;
+        let mut last_progress = Instant::now();
+
+        while Instant::now() < end {
+            sleep_until(next_at);
+            let now = Instant::now();
+            let record = now >= warmup_end;
+            token_carry += tokens_per_epoch;
+            let issue = token_carry.floor() as usize;
+            token_carry -= issue as f64;
+
+            for _ in 0..issue {
+                let tok = ReqToken {
+                    row_idx: (((req_id as usize).wrapping_mul(1315423911)) ^ rr) % corpus_rows,
+                    t_sched: now,
+                    record,
+                    rows: rows_per_token as u32,
+                };
+                req_id = req_id.wrapping_add(1);
+                let queue = &worker_queues[rr % worker_queues.len()];
+                rr = rr.wrapping_add(1);
+
+                if record {
+                    attempted_rows += rows_per_token;
+                }
+                if queue.push(tok).is_err() && record {
+                    dropped_rows += rows_per_token;
+                }
+            }
+
+            if attempted_rows >= 2048 || dropped_rows > 0 {
+                let _ = events_tx.send(AggEvent::AttemptBatch {
+                    attempted: attempted_rows,
+                    dropped_conn_queue_full: dropped_rows,
+                });
+                attempted_rows = 0;
+                dropped_rows = 0;
+            }
+
+            if args.progress && last_progress.elapsed() >= Duration::from_secs(1) {
+                eprintln!(
+                    "[bench3] pacer progress req_id={} attempted_rows={} dropped_rows={} mode=http1-batch",
+                    req_id, attempted_rows, dropped_rows
+                );
+                last_progress = Instant::now();
+            }
+
+            next_at += Duration::from_micros(epoch_us);
+        }
+
+        if attempted_rows > 0 || dropped_rows > 0 {
+            let _ = events_tx.send(AggEvent::AttemptBatch {
+                attempted: attempted_rows,
+                dropped_conn_queue_full: dropped_rows,
+            });
+        }
+        pacer_done.store(true, Ordering::Release);
+        if args.progress {
+            eprintln!("[bench3] pacer done req_id={} mode=http1-batch", req_id);
+        }
+        return Ok(());
     }
     let total_duration = Duration::from_secs(args.warmup + args.duration);
     let warmup_end = Instant::now() + Duration::from_secs(args.warmup);
@@ -3105,6 +3507,62 @@ fn pacer_loop(
     Ok(())
 }
 
+fn pacer_loop_http_batch_soft(
+    args: Args,
+    worker_queues: Vec<Arc<ArrayQueue<ReqToken>>>,
+    worker_stats: Vec<Arc<HttpBatchWorkerStats>>,
+    corpus_rows: usize,
+    pacer_done: Arc<AtomicBool>,
+) -> Result<()> {
+    pin_current_thread(args.pacer_cpu)?;
+    let start = Instant::now();
+    let warmup_end = start + Duration::from_secs(args.warmup);
+    let end = start + Duration::from_secs(args.warmup + args.duration);
+    let tick = Duration::from_millis(1);
+    let batch_rows = args.batch_records.max(1) as u64;
+    let rows_per_tick_fp = args.rps.max(1).saturating_mul(1_000);
+    let denom = 1_000_000u64;
+    let mut next_tick = start;
+    let mut fp_acc = 0u64;
+    let mut rr = 0usize;
+    let mut seq = 0u64;
+
+    while Instant::now() < end {
+        sleep_until(next_tick);
+        next_tick += tick;
+        fp_acc = fp_acc.saturating_add(rows_per_tick_fp);
+        while fp_acc >= denom.saturating_mul(batch_rows) {
+            let worker_idx = rr % worker_queues.len();
+            rr = rr.wrapping_add(1);
+            let row_idx = (((seq as usize).wrapping_mul(args.batch_records.max(1))) ^ worker_idx)
+                % corpus_rows;
+            let record = Instant::now() >= warmup_end;
+            let tok = ReqToken {
+                row_idx,
+                t_sched: Instant::now(),
+                record,
+                rows: batch_rows as u32,
+            };
+            if worker_queues[worker_idx].push(tok).is_ok() {
+                if record {
+                    worker_stats[worker_idx]
+                        .attempted
+                        .fetch_add(batch_rows, Ordering::Relaxed);
+                }
+            } else if record {
+                worker_stats[worker_idx]
+                    .dropped_conn_queue_full
+                    .fetch_add(batch_rows, Ordering::Relaxed);
+            }
+            fp_acc -= denom.saturating_mul(batch_rows);
+            seq = seq.wrapping_add(1);
+        }
+    }
+
+    pacer_done.store(true, Ordering::Release);
+    Ok(())
+}
+
 fn pacer_loop_throughput(
     args: Args,
     worker_quotas: Vec<Arc<ThroughputQuota>>,
@@ -3145,11 +3603,7 @@ fn pacer_loop_throughput(
         if record {
             attempted_batch += 1;
         }
-        let counter = if record {
-            &quota.record
-        } else {
-            &quota.warmup
-        };
+        let counter = if record { &quota.record } else { &quota.warmup };
         let prev = counter.fetch_add(1, Ordering::AcqRel);
         if prev >= local_cap {
             counter.fetch_sub(1, Ordering::AcqRel);
@@ -3231,6 +3685,110 @@ fn write_window_row(w: &mut dyn Write, t_ms: u128, agg: &StatsAgg) -> Result<()>
     Ok(())
 }
 
+fn drain_http_batch_worker_stats(
+    page: &HttpBatchWorkerStats,
+    total: &mut StatsAgg,
+    window: &mut StatsAgg,
+) {
+    let attempted = page.attempted.swap(0, Ordering::Relaxed);
+    let dropped = page.dropped_conn_queue_full.swap(0, Ordering::Relaxed);
+    if attempted > 0 || dropped > 0 {
+        total.record_attempts(attempted, dropped);
+        window.record_attempts(attempted, dropped);
+    }
+    let dropped_after_attempt = page.dropped_after_attempt.swap(0, Ordering::Relaxed);
+    if dropped_after_attempt > 0 {
+        total.record_dropped_after_attempt(dropped_after_attempt);
+        window.record_dropped_after_attempt(dropped_after_attempt);
+    }
+    macro_rules! drain_counter {
+        ($field:ident) => {{
+            let v = page.$field.swap(0, Ordering::Relaxed);
+            total.$field += v;
+            window.$field += v;
+        }};
+    }
+    drain_counter!(ok);
+    drain_counter!(err);
+    drain_counter!(timeout);
+    drain_counter!(http_2xx);
+    drain_counter!(http_429);
+    drain_counter!(http_5xx);
+    drain_counter!(qsb2_samples);
+    drain_counter!(rsk1_samples);
+    drain_counter!(used_l2);
+    for ((dst_total, dst_window), src) in total
+        .decision_counts
+        .iter_mut()
+        .zip(window.decision_counts.iter_mut())
+        .zip(page.decision_counts.iter())
+    {
+        let v = src.swap(0, Ordering::Relaxed);
+        *dst_total += v;
+        *dst_window += v;
+    }
+    let mut lats = page.batch_latency_us.lock().expect("batch latency mutex");
+    for lat in lats.drain(..) {
+        let lat = lat.max(1);
+        let _ = total.batch_e2e_us.record(lat);
+        let _ = window.batch_e2e_us.record(lat);
+    }
+}
+
+fn run_aggregator_http_batch_pull(
+    args: &Args,
+    pages: &[Arc<HttpBatchWorkerStats>],
+    start: Instant,
+) -> Result<StatsAgg> {
+    let mut total = StatsAgg::new()?;
+    let mut window = StatsAgg::new()?;
+    let mut next_window = if args.window_ms > 0 {
+        Some(start + Duration::from_millis(args.window_ms))
+    } else {
+        None
+    };
+
+    let mut window_writer: Option<Box<dyn Write + Send>> = if let Some(path) =
+        args.window_csv.as_ref()
+    {
+        let mut f: Box<dyn Write + Send> = Box::new(
+            File::create(path).with_context(|| format!("create window csv: {}", path.display()))?,
+        );
+        write_window_csv_header(&mut *f)?;
+        Some(f)
+    } else {
+        None
+    };
+
+    loop {
+        let mut all_done = true;
+        for page in pages {
+            drain_http_batch_worker_stats(page, &mut total, &mut window);
+            all_done &= page.done.load(Ordering::Acquire);
+        }
+
+        if let Some(deadline) = next_window {
+            if Instant::now() >= deadline {
+                if let Some(w) = window_writer.as_mut() {
+                    write_window_row(&mut **w, start.elapsed().as_millis(), &window)?;
+                }
+                window.reset_window()?;
+                next_window = Some(deadline + Duration::from_millis(args.window_ms));
+            }
+        }
+
+        if all_done {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Some(w) = window_writer.as_mut() {
+        write_window_row(&mut **w, start.elapsed().as_millis(), &window)?;
+    }
+    Ok(total)
+}
+
 fn run_aggregator(
     args: &Args,
     rx: Receiver<AggEvent>,
@@ -3280,6 +3838,12 @@ fn run_aggregator(
                 total.record_throughput_batch(&batch);
                 window.record_throughput_batch(&batch);
             }
+            Ok(AggEvent::ThroughputBatches { items }) => {
+                for batch in &items {
+                    total.record_throughput_batch(batch);
+                    window.record_throughput_batch(batch);
+                }
+            }
             Ok(AggEvent::WorkerDone) => {
                 done_workers += 1;
             }
@@ -3318,6 +3882,8 @@ fn pick_workers(args: &Args, worker_cpus: &Option<Vec<usize>>) -> usize {
 
 fn verdict_for(args: &Args, total: &StatsAgg) -> (Verdict, Vec<String>, Vec<String>) {
     let attempted_rps = total.attempted as f64 / (args.duration as f64).max(1.0);
+    let offered_rps =
+        (total.attempted + total.drop_conn_queue_full) as f64 / (args.duration as f64).max(1.0);
     let queue_p99 = match args.mode {
         BenchMode::Latency => hist_q(&total.queue_delay_us, 0.99),
         BenchMode::Throughput => hist_q(&total.batch_e2e_us, 0.99),
@@ -3330,14 +3896,28 @@ fn verdict_for(args: &Args, total: &StatsAgg) -> (Verdict, Vec<String>, Vec<Stri
     if total.drop_inflight_cap > 0 {
         client.push(format!("drop_inflight_cap={}", total.drop_inflight_cap));
     }
-    if total.drop_conn_queue_full > 0 {
+    if attempted_rps < (args.rps as f64) * 0.98 {
+        if args.batch_mode == BatchMode::Http1 {
+            client.push(format!(
+                "under_target_rows={:.1} offered_rows={:.1}",
+                (args.rps as f64 - attempted_rps).max(0.0),
+                offered_rps
+            ));
+        } else {
+            client.push(format!("attempted_rps={:.1} (<98% target)", attempted_rps));
+        }
+    }
+    if args.batch_mode != BatchMode::Http1 && total.drop_conn_queue_full > 0 {
         client.push(format!(
             "drop_conn_queue_full={}",
             total.drop_conn_queue_full
         ));
     }
-    if attempted_rps < (args.rps as f64) * 0.98 {
-        client.push(format!("attempted_rps={:.1} (<98% target)", attempted_rps));
+    if args.batch_mode == BatchMode::Http1 && total.dropped_after_attempt > 0 {
+        client.push(format!(
+            "dropped_after_attempt={}",
+            total.dropped_after_attempt
+        ));
     }
     if args.batch_mode == BatchMode::Off
         && (queue_p99 >= 5_000 || queue_p99 >= target_period_us.saturating_mul(10))
@@ -3395,7 +3975,10 @@ fn main() -> Result<()> {
     }
     let workload = load_workload_source(&args)?;
     let (corpus, route_meta) = match &workload {
-        WorkloadSource::Corpus { payload, route_meta } => (Some(payload.clone()), route_meta.clone()),
+        WorkloadSource::Corpus {
+            payload,
+            route_meta,
+        } => (Some(payload.clone()), route_meta.clone()),
         WorkloadSource::Ceiling { .. } => (None, None),
     };
     let req_tpl = if target.transport == TransportKind::Http {
@@ -3450,10 +4033,13 @@ fn main() -> Result<()> {
         .saturating_mul(args.max_inflight_per_conn.max(1))
         .saturating_mul(queue_depth_scale)
         .max(1);
+    let use_http_batch_pull =
+        args.mode == BenchMode::Throughput && args.batch_mode == BatchMode::Http1;
     let (events_tx, events_rx) = crossbeam_channel::unbounded::<AggEvent>();
     let pacer_done = Arc::new(AtomicBool::new(false));
     let mut worker_queues = Vec::with_capacity(workers);
     let mut throughput_quotas = Vec::with_capacity(workers);
+    let mut http_batch_stats = Vec::with_capacity(workers);
     let mut worker_handles = Vec::with_capacity(workers);
 
     for worker_id in 0..workers {
@@ -3465,10 +4051,18 @@ fn main() -> Result<()> {
         } else {
             None
         };
-        let throughput_quota = if args.mode == BenchMode::Throughput && args.batch_mode != BatchMode::Http1 {
-            let quota = Arc::new(ThroughputQuota::default());
-            throughput_quotas.push(quota.clone());
-            Some(quota)
+        let throughput_quota =
+            if args.mode == BenchMode::Throughput && args.batch_mode != BatchMode::Http1 {
+                let quota = Arc::new(ThroughputQuota::default());
+                throughput_quotas.push(quota.clone());
+                Some(quota)
+            } else {
+                None
+            };
+        let batch_stats = if use_http_batch_pull {
+            let stats = Arc::new(HttpBatchWorkerStats::default());
+            http_batch_stats.push(stats.clone());
+            Some(stats)
         } else {
             None
         };
@@ -3487,9 +4081,11 @@ fn main() -> Result<()> {
         let h = thread::Builder::new()
             .name(name)
             .spawn(move || {
-            let res = match target2.transport {
+                let res = match target2.transport {
                     TransportKind::Http => {
-                        let corpus = corpus2.clone().expect("http worker requires corpus workload");
+                        let corpus = corpus2
+                            .clone()
+                            .expect("http worker requires corpus workload");
                         if args2.batch_mode == BatchMode::Http1 {
                             worker_loop_http_batch(
                                 worker_id,
@@ -3500,7 +4096,7 @@ fn main() -> Result<()> {
                                 route_meta2,
                                 req_tpl2.expect("http batch worker requires request template"),
                                 queue.expect("http batch worker requires queue ingress"),
-                                tx2.clone(),
+                                batch_stats.expect("http batch worker requires shared stats"),
                                 done2,
                             )
                         } else {
@@ -3545,30 +4141,44 @@ fn main() -> Result<()> {
     let pacer_args = args.clone();
     let pacer_done2 = pacer_done.clone();
     let tx2 = events_tx.clone();
+    let http_batch_stats_for_pacer = http_batch_stats.clone();
     let pacer_handle = thread::Builder::new()
         .name("bench3-pacer".to_string())
         .spawn(move || {
             let res = match pacer_args.mode {
-                BenchMode::Latency => {
-                    pacer_loop(
-                        pacer_args,
-                        worker_queues,
-                        payload_rows,
-                        tx2,
-                        pacer_done2.clone(),
-                    )
-                }
+                BenchMode::Latency => pacer_loop(
+                    pacer_args,
+                    worker_queues,
+                    payload_rows,
+                    tx2,
+                    pacer_done2.clone(),
+                ),
                 BenchMode::Throughput => {
                     if pacer_args.batch_mode == BatchMode::Http1 {
-                        pacer_loop(
+                        if use_http_batch_pull {
+                            pacer_loop_http_batch_soft(
+                                pacer_args,
+                                worker_queues,
+                                http_batch_stats_for_pacer,
+                                payload_rows,
+                                pacer_done2.clone(),
+                            )
+                        } else {
+                            pacer_loop(
+                                pacer_args,
+                                worker_queues,
+                                payload_rows,
+                                tx2,
+                                pacer_done2.clone(),
+                            )
+                        }
+                    } else {
+                        pacer_loop_throughput(
                             pacer_args,
-                            worker_queues,
-                            payload_rows,
+                            throughput_quotas,
                             tx2,
                             pacer_done2.clone(),
                         )
-                    } else {
-                        pacer_loop_throughput(pacer_args, throughput_quotas, tx2, pacer_done2.clone())
                     }
                 }
             };
@@ -3581,7 +4191,11 @@ fn main() -> Result<()> {
         .context("spawn pacer")?;
 
     drop(events_tx);
-    let total = run_aggregator(&args, events_rx, workers, start)?;
+    let total = if use_http_batch_pull {
+        run_aggregator_http_batch_pull(&args, &http_batch_stats, start)?
+    } else {
+        run_aggregator(&args, events_rx, workers, start)?
+    };
 
     pacer_handle
         .join()
@@ -3592,6 +4206,21 @@ fn main() -> Result<()> {
 
     let attempted_rps = total.attempted as f64 / (args.duration as f64).max(1.0);
     let ok_rps = total.ok as f64 / (args.duration as f64).max(1.0);
+    let offered = total.attempted + total.drop_conn_queue_full;
+    let offered_rps = offered as f64 / (args.duration as f64).max(1.0);
+    let offered_but_not_sent = total.drop_conn_queue_full;
+    let offered_but_not_sent_rps = offered_but_not_sent as f64 / (args.duration as f64).max(1.0);
+    let offered_but_not_sent_pct = if offered == 0 {
+        0.0
+    } else {
+        offered_but_not_sent as f64 / offered as f64
+    };
+    let under_target_rps = (args.rps as f64 - attempted_rps).max(0.0);
+    let under_target_pct = if args.rps == 0 {
+        0.0
+    } else {
+        under_target_rps / args.rps as f64
+    };
     let attempted_batch_rps = if args.batch_mode == BatchMode::Http1 {
         attempted_rps / (args.batch_records.max(1) as f64)
     } else {
@@ -3618,8 +4247,17 @@ fn main() -> Result<()> {
     let (verdict, client_reasons, server_reasons) = verdict_for(&args, &total);
 
     println!(
-        "[bench3 rps={}] attempted={} ok={} err={} timeout={} dropped={} attempted_rps={:.1} ok_rps={:.1}",
-        args.rps, total.attempted, total.ok, total.err, total.timeout, total.dropped, attempted_rps, ok_rps
+        "[bench3 rps={}] offered={} attempted={} ok={} err={} timeout={} dropped={} offered_rps={:.1} attempted_rps={:.1} ok_rps={:.1}",
+        args.rps,
+        offered,
+        total.attempted,
+        total.ok,
+        total.err,
+        total.timeout,
+        total.dropped,
+        offered_rps,
+        attempted_rps,
+        ok_rps
     );
     if args.batch_mode == BatchMode::Http1 {
         println!(
@@ -3644,6 +4282,12 @@ fn main() -> Result<()> {
         "[bench3] status: 2xx={} 429={} 5xx={} timeout={} drop_inflight_cap={} drop_conn_queue_full={}",
         total.http_2xx, total.http_429, total.http_5xx, total.timeout, total.drop_inflight_cap, total.drop_conn_queue_full
     );
+    if args.batch_mode == BatchMode::Http1 {
+        println!(
+            "[bench3] batch_drop: offered_but_not_sent={} dropped_after_attempt={}",
+            total.drop_conn_queue_full, total.dropped_after_attempt
+        );
+    }
     println!(
         "[bench3] protocol: rsk1_samples={} qsb2_samples={} used_l2={} decisions={{allow:{}, deny:{}, manual_review:{}, degrade_allow:{}, unknown:{}}}",
         total.rsk1_samples,
@@ -3705,6 +4349,7 @@ fn main() -> Result<()> {
                 raw_version: None,
             },
             counts: SummaryCounts {
+                offered,
                 attempted: total.attempted,
                 ok: total.ok,
                 err: total.err,
@@ -3712,6 +4357,7 @@ fn main() -> Result<()> {
                 dropped: total.dropped,
                 drop_inflight_cap: total.drop_inflight_cap,
                 drop_conn_queue_full: total.drop_conn_queue_full,
+                dropped_after_attempt: total.dropped_after_attempt,
                 http_2xx: total.http_2xx,
                 http_429: total.http_429,
                 http_5xx: total.http_5xx,
@@ -3725,29 +4371,55 @@ fn main() -> Result<()> {
                 decision_unknown: total.decision_counts[decision_bucket(255)],
                 attempted_rps,
                 ok_rps,
+                target_rps: args.rps,
+                offered_but_not_sent,
+                offered_but_not_sent_rps,
+                offered_but_not_sent_pct,
+                under_target_rps,
+                under_target_pct,
                 attempted_batch_rps,
                 ok_batch_rps,
             },
             latency_us: SummaryLatency {
                 queue_delay: match args.mode {
                     BenchMode::Latency => queue_q,
-                    BenchMode::Throughput => LatQuantiles { p50: 0, p95: 0, p99: 0 },
+                    BenchMode::Throughput => LatQuantiles {
+                        p50: 0,
+                        p95: 0,
+                        p99: 0,
+                    },
                 },
                 send_delay: match args.mode {
                     BenchMode::Latency => send_q,
-                    BenchMode::Throughput => LatQuantiles { p50: 0, p95: 0, p99: 0 },
+                    BenchMode::Throughput => LatQuantiles {
+                        p50: 0,
+                        p95: 0,
+                        p99: 0,
+                    },
                 },
                 server_rtt: match args.mode {
                     BenchMode::Latency => server_q,
-                    BenchMode::Throughput => LatQuantiles { p50: 0, p95: 0, p99: 0 },
+                    BenchMode::Throughput => LatQuantiles {
+                        p50: 0,
+                        p95: 0,
+                        p99: 0,
+                    },
                 },
                 e2e: match args.mode {
                     BenchMode::Latency => e2e_q,
-                    BenchMode::Throughput => LatQuantiles { p50: 0, p95: 0, p99: 0 },
+                    BenchMode::Throughput => LatQuantiles {
+                        p50: 0,
+                        p95: 0,
+                        p99: 0,
+                    },
                 },
             },
             batch_latency_us: match args.mode {
-                BenchMode::Latency => LatQuantiles { p50: 0, p95: 0, p99: 0 },
+                BenchMode::Latency => LatQuantiles {
+                    p50: 0,
+                    p95: 0,
+                    p99: 0,
+                },
                 BenchMode::Throughput => batch_q,
             },
             stage_p99_us: match args.mode {

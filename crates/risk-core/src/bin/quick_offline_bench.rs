@@ -2,6 +2,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use memmap2::Mmap;
 use pprof::ProfilerGuardBuilder;
+use risk_core::config::Config;
+use risk_core::pipeline::{AppCore, StandaloneL2TauMode};
 use risk_core::quickscorer::policy::{L2FeatureSource, QuickPolicy};
 use risk_core::quickscorer::{QuickRouteMeta, QuickScorerEngine};
 use risk_quickscorer::MinpackRuntime;
@@ -65,6 +67,7 @@ enum BenchMode {
     L1,
     L2,
     Mixed,
+    ScoreOnlyInproc,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -222,6 +225,9 @@ fn main() -> Result<()> {
         BenchMode::L1 => run_l1_bench(&cli, &dense, &pprof_cfg)?,
         BenchMode::L2 => run_l2_bench(&cli, &dense, route_meta.as_deref(), &pprof_cfg)?,
         BenchMode::Mixed => run_mixed_bench(&cli, &dense, route_meta.as_deref(), &pprof_cfg)?,
+        BenchMode::ScoreOnlyInproc => {
+            run_score_only_inproc_bench(&cli, &dense, route_meta.as_deref(), &pprof_cfg)?
+        }
     };
 
     if let Some(path) = &cli.summary_json {
@@ -411,8 +417,12 @@ fn run_mixed_bench(
     let engine = (!use_dedicated)
         .then(|| QuickScorerEngine::load(&cli.bundle_dir))
         .transpose()?;
-    let runtime = use_dedicated.then(|| MinpackRuntime::load(&cli.bundle_dir)).transpose()?;
-    let policy = use_dedicated.then(|| QuickPolicy::load_bundle(&cli.bundle_dir)).transpose()?;
+    let runtime = use_dedicated
+        .then(|| MinpackRuntime::load(&cli.bundle_dir))
+        .transpose()?;
+    let policy = use_dedicated
+        .then(|| QuickPolicy::load_bundle(&cli.bundle_dir))
+        .transpose()?;
     let l2_policy = policy.as_ref().and_then(|x| x.l2.as_ref());
     let candidate_rows = limit_rows(dense.n_rows, cli.max_rows);
     let warmup_rows = cli.warmup_rows.min(candidate_rows);
@@ -520,6 +530,126 @@ fn run_mixed_bench(
 
     Ok(summarize_runs(
         BenchMode::Mixed,
+        dense,
+        candidate_rows,
+        warmup_rows,
+        measure_rows,
+        cli.repeat,
+        runs,
+        used_l2_rows,
+        allow_rows,
+        deny_rows,
+        manual_review_rows,
+    ))
+}
+
+fn run_score_only_inproc_bench(
+    cli: &Cli,
+    dense: &DenseRows,
+    route_meta: Option<&[Option<RouteMetaRow>]>,
+    pprof_cfg: &PprofCfg<'_>,
+) -> Result<BenchSummary> {
+    const BATCH_ROWS: usize = 128;
+
+    let candidate_rows = limit_rows(dense.n_rows, cli.max_rows);
+    let candidate_rows = candidate_rows - (candidate_rows % BATCH_ROWS);
+    if candidate_rows < BATCH_ROWS {
+        bail!(
+            "score_only_inproc requires at least {} aligned rows, got {}",
+            BATCH_ROWS,
+            candidate_rows
+        );
+    }
+
+    let warmup_rows = cli.warmup_rows.min(candidate_rows);
+    let warmup_rows = warmup_rows - (warmup_rows % BATCH_ROWS);
+    let measure_rows = cli.measure_rows.min(candidate_rows);
+    let measure_rows = measure_rows - (measure_rows % BATCH_ROWS);
+    if measure_rows < BATCH_ROWS {
+        bail!(
+            "score_only_inproc measure_rows must be >= {} after batch alignment, got {}",
+            BATCH_ROWS,
+            measure_rows
+        );
+    }
+
+    let core = AppCore::new_with_quickscorer_bundle(Config::default(), &cli.bundle_dir)?;
+    let standalone_l2 = if cli.standalone_l2 {
+        Some(if let Some(path) = cli.standalone_l2_feat_bin.as_deref() {
+            StandaloneL2Runtime::load_with_feat_bin_override(&cli.bundle_dir, Some(path))?
+        } else {
+            StandaloneL2Runtime::load(&cli.bundle_dir)?
+        })
+    } else {
+        None
+    };
+    let tau_mode = cli
+        .standalone_l2_fixed_tau
+        .map(StandaloneL2TauMode::Fixed)
+        .unwrap_or(StandaloneL2TauMode::Request);
+
+    for start in (0..warmup_rows).step_by(BATCH_ROWS) {
+        let batch = prepare_batch128_inputs(dense, route_meta, start)?;
+        if let Some(rt) = standalone_l2.as_ref() {
+            std::hint::black_box(core.score_standalone_batch128_http_ack_lite(
+                &batch.rows,
+                &batch.metas,
+                rt,
+                tau_mode,
+            )?);
+        } else {
+            std::hint::black_box(
+                core.score_quick_dense_batch128_http_ack_lite(&batch.rows, &batch.metas)?,
+            );
+        }
+    }
+
+    let guard = maybe_start_profiler(pprof_cfg)?;
+    let mut runs = Vec::with_capacity(cli.repeat);
+    let mut used_l2_rows = 0usize;
+    let mut allow_rows = 0usize;
+    let mut deny_rows = 0usize;
+    let mut manual_review_rows = 0usize;
+
+    for rep in 0..cli.repeat {
+        let t0 = Instant::now();
+        let mut used_l2 = 0usize;
+        let mut allow = 0usize;
+        let mut deny = 0usize;
+        let mut review = 0usize;
+
+        for start in (0..measure_rows).step_by(BATCH_ROWS) {
+            let batch = prepare_batch128_inputs(dense, route_meta, start)?;
+            let (batch_used_l2, decision_counts) = if let Some(rt) = standalone_l2.as_ref() {
+                core.score_standalone_batch128_http_ack_lite(
+                    &batch.rows,
+                    &batch.metas,
+                    rt,
+                    tau_mode,
+                )?
+            } else {
+                core.score_quick_dense_batch128_http_ack_lite(&batch.rows, &batch.metas)?
+            };
+            used_l2 += batch_used_l2 as usize;
+            allow += decision_counts[0] as usize;
+            deny += decision_counts[1] as usize;
+            review += decision_counts[2] as usize;
+            std::hint::black_box(decision_counts);
+        }
+
+        let elapsed = t0.elapsed().as_secs_f64();
+        runs.push(measure_rows as f64 / elapsed.max(1e-9));
+        if rep + 1 == cli.repeat {
+            used_l2_rows = used_l2;
+            allow_rows = allow;
+            deny_rows = deny;
+            manual_review_rows = review;
+        }
+    }
+    maybe_write_flamegraph(guard, pprof_cfg)?;
+
+    Ok(summarize_runs(
+        BenchMode::ScoreOnlyInproc,
         dense,
         candidate_rows,
         warmup_rows,
@@ -761,6 +891,28 @@ fn route_meta_for_row(
         seg_prod_amtbin: meta.seg_prod_amtbin,
         l2_tau_used: Some(meta.l2_tau_used),
     })
+}
+
+struct Batch128Inputs<'a> {
+    rows: [&'a [u8]; 128],
+    metas: [Option<QuickRouteMeta>; 128],
+}
+
+fn prepare_batch128_inputs<'a>(
+    dense: &'a DenseRows,
+    route_meta: Option<&[Option<RouteMetaRow>]>,
+    start_row_idx: usize,
+) -> Result<Batch128Inputs<'a>> {
+    let mut rows = std::array::from_fn(|_| dense.row_bytes(0));
+    let mut metas = [None; 128];
+    for i in 0..128 {
+        let row_idx = (start_row_idx + i) % dense.n_rows;
+        rows[i] = dense.row_bytes(row_idx);
+        if let Some(route_meta) = route_meta {
+            metas[i] = Some(route_meta_for_row(route_meta, row_idx)?);
+        }
+    }
+    Ok(Batch128Inputs { rows, metas })
 }
 
 fn summarize_runs(

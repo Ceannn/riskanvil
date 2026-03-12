@@ -760,6 +760,9 @@ impl ResponseParser {
         &mut self,
         stream: &mut TcpStream,
     ) -> io::Result<Option<(HttpResponseMeta, BodyDecoded)>> {
+        if let Some(done) = self.try_finish()? {
+            return Ok(Some(done));
+        }
         let mut tmp = [0u8; 4096];
         loop {
             match stream.read(&mut tmp) {
@@ -791,6 +794,9 @@ impl ResponseParser {
         &mut self,
         stream: &mut TcpStream,
     ) -> io::Result<Option<(HttpResponseMeta, BatchAck)>> {
+        if let Some(done) = self.try_finish_batch_ack()? {
+            return Ok(Some(done));
+        }
         let mut tmp = [0u8; 4096];
         loop {
             match stream.read(&mut tmp) {
@@ -861,6 +867,7 @@ impl ResponseParser {
             };
             let body = &self.buf[self.header_len..self.header_len + self.content_len];
             let decoded = decode_body(body)?;
+            self.consume_parsed(self.header_len + self.content_len);
             return Ok(Some((meta, decoded)));
         }
         Ok(None)
@@ -894,15 +901,34 @@ impl ResponseParser {
             };
             let body = &self.buf[self.header_len..self.header_len + self.content_len];
             if let Some(ack) = decode_batch_ack_body(body) {
+                self.consume_parsed(self.header_len + self.content_len);
                 return Ok(Some((meta, ack)));
             }
             match decode_body(body)? {
-                BodyDecoded::BatchAck(ack) => Ok(Some((meta, ack))),
+                BodyDecoded::BatchAck(ack) => {
+                    self.consume_parsed(self.header_len + self.content_len);
+                    Ok(Some((meta, ack)))
+                }
                 _ => Err(invalid_data("expected batch ack response")),
             }
         } else {
             Ok(None)
         }
+    }
+
+    fn consume_parsed(&mut self, parsed_len: usize) {
+        if parsed_len >= self.buf.len() {
+            self.buf.clear();
+        } else {
+            let remain = self.buf.len() - parsed_len;
+            self.buf.copy_within(parsed_len.., 0);
+            self.buf.truncate(remain);
+        }
+        self.header_len = 0;
+        self.content_len = 0;
+        self.status_code = 0;
+        self.timings_header = None;
+        self.headers_parsed = false;
     }
 }
 
@@ -957,15 +983,26 @@ struct BatchConn {
     token: Token,
     stream: TcpStream,
     pending: VecDeque<QueuedReq>,
-    active: Option<BatchActiveReq>,
+    writing: Option<BatchActiveReq>,
+    inflight: VecDeque<BatchActiveReq>,
     write_state: BatchWriteState,
-    reading: bool,
     parser: ResponseParser,
 }
 
 impl BatchConn {
     fn load(&self) -> usize {
-        self.pending.len() + usize::from(self.active.is_some())
+        self.pending.len() + self.inflight.len() + usize::from(self.writing.is_some())
+    }
+
+    fn wants_write(&self) -> bool {
+        self.writing.is_some() || !self.pending.is_empty()
+    }
+
+    fn oldest_deadline(&self) -> Option<Instant> {
+        self.inflight
+            .front()
+            .map(|active| active.deadline)
+            .or_else(|| self.writing.as_ref().map(|active| active.deadline))
     }
 }
 
@@ -2657,7 +2694,8 @@ fn reconnect_batch_conn(conn: &mut BatchConn, poll: &Poll, target: &Target) -> R
         .deregister(&mut conn.stream)
         .context("deregister batch conn")?;
     conn.stream = connect_stream(target.addr)?;
-    conn.reading = false;
+    conn.writing = None;
+    conn.inflight.clear();
     conn.parser.reset();
     conn.write_state = BatchWriteState::default();
     register_conn(poll, &mut conn.stream, conn.token, false)?;
@@ -2670,7 +2708,7 @@ fn flush_write_batch(
     corpus: &PayloadCorpus,
     route_meta: Option<&RouteMetaCorpus>,
 ) -> io::Result<bool> {
-    let Some(active) = conn.active.as_ref() else {
+    let Some(active) = conn.writing.as_ref() else {
         return Ok(true);
     };
     let prefix = req_tpl.prefix.as_slice();
@@ -2749,19 +2787,18 @@ fn flush_write_batch(
     Ok(conn.write_state.prefix_off >= prefix.len() && conn.write_state.body_off >= total_body_len)
 }
 
-fn start_next_send_batch(
+fn prime_next_write_batch(
     conn: &mut BatchConn,
-    poll: &Poll,
     timeout: Duration,
     corpus: &PayloadCorpus,
     route_meta: Option<&RouteMetaCorpus>,
     batch_records: usize,
-) -> Result<()> {
-    if conn.active.is_some() {
-        return Ok(());
+) {
+    if conn.writing.is_some() {
+        return;
     }
     let Some(next) = conn.pending.pop_front() else {
-        return Ok(());
+        return;
     };
     let rows = next.rows.max(1) as usize;
     let batch_records = rows.min(batch_records.max(1));
@@ -2770,7 +2807,7 @@ fn start_next_send_batch(
         record_len(corpus, route_meta),
         route_meta.is_some(),
     );
-    conn.active = Some(BatchActiveReq {
+    conn.writing = Some(BatchActiveReq {
         start_row_idx: next.row_idx,
         t_sched: next.t_sched,
         deadline: Instant::now() + timeout,
@@ -2780,10 +2817,66 @@ fn start_next_send_batch(
         batch_header,
     });
     conn.write_state = BatchWriteState::default();
-    conn.reading = false;
-    conn.parser.reset();
-    reregister_conn(poll, &mut conn.stream, conn.token, true)?;
-    Ok(())
+}
+
+fn update_batch_conn_interest(conn: &mut BatchConn, poll: &Poll) -> Result<()> {
+    let token = conn.token;
+    let writable = conn.wants_write();
+    reregister_conn(poll, &mut conn.stream, token, writable)
+}
+
+fn record_batch_pending_drop(conn: &mut BatchConn, local_stats: &mut HttpBatchWorkerLocal) {
+    let mut dropped_rows = 0u64;
+    while let Some(req) = conn.pending.pop_front() {
+        if req.record {
+            dropped_rows += req.rows.max(1) as u64;
+        }
+    }
+    if dropped_rows > 0 {
+        local_stats.record_dropped_after_attempt(dropped_rows);
+    }
+}
+
+fn record_batch_inflight_timeouts(
+    conn: &mut BatchConn,
+    now: Instant,
+    local_stats: &mut HttpBatchWorkerLocal,
+) {
+    if let Some(active) = conn.writing.take() {
+        if active.record {
+            local_stats.record_batch(throughput_done_from_batch_timeout(&active, now));
+        }
+    }
+    while let Some(active) = conn.inflight.pop_front() {
+        if active.record {
+            local_stats.record_batch(throughput_done_from_batch_timeout(&active, now));
+        }
+    }
+    conn.write_state = BatchWriteState::default();
+}
+
+fn fail_batch_conn(
+    conn: &mut BatchConn,
+    poll: &Poll,
+    target: &Target,
+    now: Instant,
+    local_stats: &mut HttpBatchWorkerLocal,
+) -> Result<()> {
+    record_batch_pending_drop(conn, local_stats);
+    record_batch_inflight_timeouts(conn, now, local_stats);
+    reconnect_batch_conn(conn, poll, target)
+}
+
+fn start_next_send_batch(
+    conn: &mut BatchConn,
+    poll: &Poll,
+    timeout: Duration,
+    corpus: &PayloadCorpus,
+    route_meta: Option<&RouteMetaCorpus>,
+    batch_records: usize,
+) -> Result<()> {
+    prime_next_write_batch(conn, timeout, corpus, route_meta, batch_records);
+    update_batch_conn_interest(conn, poll)
 }
 
 fn throughput_done_from_batch_ack(
@@ -3086,9 +3179,9 @@ fn worker_loop_http_batch(
             token,
             stream,
             pending: VecDeque::with_capacity(args.max_inflight_per_conn.max(1)),
-            active: None,
+            writing: None,
+            inflight: VecDeque::with_capacity(args.max_inflight_per_conn.max(1)),
             write_state: BatchWriteState::default(),
-            reading: false,
             parser: ResponseParser::with_capacity(),
         });
     }
@@ -3144,26 +3237,11 @@ fn worker_loop_http_batch(
 
         let now = Instant::now();
         for conn in &mut conns {
-            if let Some(active) = conn.active.as_ref() {
-                if now >= active.deadline {
-                    let active = conn.active.take();
-                    conn.pending.clear();
-                    reconnect_batch_conn(conn, &poll, &target)?;
-                    if let Some(active) = active {
-                        if active.record {
-                            local_stats
-                                .record_batch(throughput_done_from_batch_timeout(&active, now));
-                        }
-                    }
-                    start_next_send_batch(
-                        conn,
-                        &poll,
-                        timeout,
-                        &corpus,
-                        route_meta.as_ref(),
-                        args.batch_records,
-                    )?;
-                }
+            if conn
+                .oldest_deadline()
+                .is_some_and(|deadline| now >= deadline)
+            {
+                fail_batch_conn(conn, &poll, &target, now, &mut local_stats)?;
             }
         }
 
@@ -3171,7 +3249,7 @@ fn worker_loop_http_batch(
             && local_pending.is_empty()
             && conns
                 .iter()
-                .all(|c| c.active.is_none() && c.pending.is_empty());
+                .all(|c| c.writing.is_none() && c.inflight.is_empty() && c.pending.is_empty());
         if pacing_done && all_idle {
             break;
         }
@@ -3185,13 +3263,7 @@ fn worker_loop_http_batch(
                     &mut conns,
                 ));
                 for conn in &mut conns {
-                    if let Some(active) = conn.active.take() {
-                        if active.record {
-                            local_stats
-                                .record_batch(throughput_done_from_batch_timeout(&active, now));
-                        }
-                    }
-                    conn.reading = false;
+                    record_batch_inflight_timeouts(conn, now, &mut local_stats);
                     conn.parser.reset();
                 }
                 break;
@@ -3209,87 +3281,73 @@ fn worker_loop_http_batch(
                 continue;
             }
             let conn = &mut conns[idx];
-            if ev.is_writable() && conn.active.is_some() {
-                match flush_write_batch(conn, &req_tpl, &corpus, route_meta.as_ref()) {
-                    Ok(true) => {
-                        if let Some(active) = conn.active.as_mut() {
-                            active.deadline = Instant::now() + timeout;
-                        }
-                        conn.reading = true;
-                        reregister_conn(&poll, &mut conn.stream, conn.token, false)?;
-                    }
-                    Ok(false) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        let active = conn.active.take();
-                        conn.pending.clear();
-                        reconnect_batch_conn(conn, &poll, &target)?;
-                        if let Some(active) = active {
-                            if active.record {
-                                local_stats.record_batch(throughput_done_from_batch_timeout(
-                                    &active,
-                                    Instant::now(),
-                                ));
-                            }
-                        }
-                        start_next_send_batch(
-                            conn,
-                            &poll,
-                            timeout,
-                            &corpus,
-                            route_meta.as_ref(),
-                            args.batch_records,
-                        )?;
-                    }
-                }
-            }
-
-            if ev.is_readable() && conn.reading {
-                match conn.parser.read_batch_ack_from(&mut conn.stream) {
-                    Ok(Some((meta, ack))) => {
-                        let done_at = Instant::now();
-                        if let Some(active) = conn.active.take() {
+            if ev.is_readable() && !conn.inflight.is_empty() {
+                loop {
+                    match conn.parser.read_batch_ack_from(&mut conn.stream) {
+                        Ok(Some((meta, ack))) => {
+                            let done_at = Instant::now();
+                            let Some(active) = conn.inflight.pop_front() else {
+                                fail_batch_conn(conn, &poll, &target, done_at, &mut local_stats)?;
+                                break;
+                            };
                             if active.record {
                                 let batch =
                                     throughput_done_from_batch_ack(&active, done_at, meta, ack);
                                 local_stats.record_batch(batch);
                             }
                         }
-                        conn.parser.reset();
-                        conn.reading = false;
-                        start_next_send_batch(
-                            conn,
-                            &poll,
-                            timeout,
-                            &corpus,
-                            route_meta.as_ref(),
-                            args.batch_records,
-                        )?;
-                    }
-                    Ok(None) => {}
-                    Err(_) => {
-                        let active = conn.active.take();
-                        conn.pending.clear();
-                        reconnect_batch_conn(conn, &poll, &target)?;
-                        if let Some(active) = active {
-                            if active.record {
-                                local_stats.record_batch(throughput_done_from_batch_timeout(
-                                    &active,
-                                    Instant::now(),
-                                ));
-                            }
+                        Ok(None) => break,
+                        Err(_) => {
+                            fail_batch_conn(
+                                conn,
+                                &poll,
+                                &target,
+                                Instant::now(),
+                                &mut local_stats,
+                            )?;
+                            break;
                         }
-                        start_next_send_batch(
-                            conn,
-                            &poll,
-                            timeout,
-                            &corpus,
-                            route_meta.as_ref(),
-                            args.batch_records,
-                        )?;
                     }
                 }
             }
+
+            if ev.is_writable() {
+                loop {
+                    prime_next_write_batch(
+                        conn,
+                        timeout,
+                        &corpus,
+                        route_meta.as_ref(),
+                        args.batch_records,
+                    );
+                    if conn.writing.is_none() {
+                        break;
+                    }
+                    match flush_write_batch(conn, &req_tpl, &corpus, route_meta.as_ref()) {
+                        Ok(true) => {
+                            if let Some(mut active) = conn.writing.take() {
+                                active.deadline = Instant::now() + timeout;
+                                conn.inflight.push_back(active);
+                            }
+                            conn.write_state = BatchWriteState::default();
+                        }
+                        Ok(false) => break,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            fail_batch_conn(
+                                conn,
+                                &poll,
+                                &target,
+                                Instant::now(),
+                                &mut local_stats,
+                            )?;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            update_batch_conn_interest(conn, &poll)?;
         }
 
         if last_local_flush.elapsed() >= Duration::from_millis(100) {
@@ -4442,4 +4500,65 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_batch_aggregate_ack_for_test(
+        record_count: u32,
+        ok_count: u32,
+        used_l2_count: u32,
+        decision_counts: [u32; 5],
+    ) -> [u8; 40] {
+        let mut out = [0u8; 40];
+        out[0..4].copy_from_slice(b"RBA1");
+        out[4..6].copy_from_slice(&1u16.to_le_bytes());
+        out[6..8].copy_from_slice(&0u16.to_le_bytes());
+        out[8..12].copy_from_slice(&record_count.to_le_bytes());
+        out[12..16].copy_from_slice(&ok_count.to_le_bytes());
+        out[16..20].copy_from_slice(&used_l2_count.to_le_bytes());
+        for (idx, count) in decision_counts.iter().enumerate() {
+            let off = 20 + idx * 4;
+            out[off..off + 4].copy_from_slice(&count.to_le_bytes());
+        }
+        out
+    }
+
+    fn encode_http_batch_ack_response(record_count: u32, ok_count: u32) -> Vec<u8> {
+        let ack =
+            encode_batch_aggregate_ack_for_test(record_count, ok_count, 0, [ok_count, 0, 0, 0, 0]);
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+            ack.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(&ack);
+        out
+    }
+
+    #[test]
+    fn batch_ack_parser_consumes_multiple_responses_from_one_buffer() {
+        let mut parser = ResponseParser::with_capacity();
+        let mut bytes = encode_http_batch_ack_response(128, 128);
+        bytes.extend_from_slice(&encode_http_batch_ack_response(128, 64));
+        parser.buf.extend_from_slice(&bytes);
+
+        let (_, first) = parser
+            .try_finish_batch_ack()
+            .expect("first parse ok")
+            .expect("first response present");
+        assert_eq!(first.record_count, 128);
+        assert_eq!(first.ok_count, 128);
+        assert!(!parser.buf.is_empty());
+
+        let (_, second) = parser
+            .try_finish_batch_ack()
+            .expect("second parse ok")
+            .expect("second response present");
+        assert_eq!(second.record_count, 128);
+        assert_eq!(second.ok_count, 64);
+        assert!(parser.buf.is_empty());
+    }
 }

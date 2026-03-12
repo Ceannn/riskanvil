@@ -2688,9 +2688,13 @@ dependencies = [
  "bytes",
  "clap",
  "h2",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "metrics",
  "metrics-exporter-prometheus",
+ "mio",
  "risk-core",
  "risk-quickscorer-standalone-l2",
  "serde",
@@ -3361,6 +3365,37 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
+]
+
+[[package]]
+name = "tokio-server-batchplane"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "clap",
+ "crossbeam-channel",
+ "crossbeam-queue",
+ "h2",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "mio",
+ "risk-core",
+ "risk-quickscorer-standalone-l2",
+ "serde",
+ "serde_json",
+ "slab",
+ "tokio",
+ "tower 0.4.13",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

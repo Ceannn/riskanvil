@@ -5,6 +5,7 @@ members = [
   "crates/risk-quickscorer",
   "crates/risk-quickscorer-standalone-l2",
   "crates/risk-server-tokio",
+  "crates/tokio-server-batchplane",
   "crates/risk-bench",
   "crates/risk-bench2",
   "crates/risk-bench3",

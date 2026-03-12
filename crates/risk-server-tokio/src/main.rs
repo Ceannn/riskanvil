@@ -28,13 +28,18 @@ use risk_core::{
     schema::{Decision, ScoreResponse},
 };
 use risk_quickscorer_standalone_l2::StandaloneL2Runtime;
-use tokio::sync::Semaphore as TokioSemaphore;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, Semaphore as TokioSemaphore};
 use tower::{BoxError, ServiceBuilder, ServiceExt};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, TraceLayer};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const HDR_RISK_TIMINGS_US: HeaderName = HeaderName::from_static("x-risk-timings-us");
+const H1_BATCH_ACK_PREFIX: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nContent-Type: application/octet-stream\r\n\r\n";
+const H1_TEXT_PREFIX_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+const MAX_H1_BATCH_HEADER_BYTES: usize = 4096;
 
 #[derive(Clone, Debug)]
 struct DenseRequest {
@@ -108,6 +113,18 @@ struct Batch128Shape {
     has_route_meta: bool,
     record_bytes: usize,
     content_len: usize,
+}
+
+struct H1BatchParsedRequest {
+    fast_path: Option<H1BatchFastPath>,
+    method: Method,
+    content_len: usize,
+    body: Bytes,
+}
+
+enum H1BatchReply {
+    Binary(Bytes),
+    Text(StatusCode, String),
 }
 
 fn env_usize(name: &str, default_value: usize) -> usize {
@@ -915,6 +932,295 @@ fn h1_batch_fast_path(path: &str) -> Option<H1BatchFastPath> {
     }
 }
 
+fn parse_peek_h1_batch_fast_path(buf: &[u8]) -> Option<H1BatchFastPath> {
+    let line_end = buf.windows(2).position(|w| w == b"\r\n")?;
+    let line = std::str::from_utf8(&buf[..line_end]).ok()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    if method != "POST" {
+        return None;
+    }
+    let path = parts.next()?;
+    h1_batch_fast_path(path)
+}
+
+async fn maybe_peek_h1_batch_fast_path(
+    stream: &tokio::net::TcpStream,
+) -> std::io::Result<Option<H1BatchFastPath>> {
+    let mut buf = [0u8; 512];
+    let n = stream.peek(&mut buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(parse_peek_h1_batch_fast_path(&buf[..n]))
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_h1_batch_request_from_buf(
+    buf: &mut BytesMut,
+) -> Result<Option<H1BatchParsedRequest>, String> {
+    let Some(header_end) = find_header_end(buf.as_ref()) else {
+        if buf.len() > MAX_H1_BATCH_HEADER_BYTES {
+            return Err("request header too large".to_string());
+        }
+        return Ok(None);
+    };
+
+    let header_bytes = &buf[..header_end];
+    let header_str =
+        std::str::from_utf8(header_bytes).map_err(|e| format!("bad request header: {e}"))?;
+    let mut lines = header_str.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "missing request line".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| "missing request method".to_string())?
+        .parse::<Method>()
+        .map_err(|e| format!("bad request method: {e}"))?;
+    let path = parts
+        .next()
+        .ok_or_else(|| "missing request path".to_string())?;
+    let _version = parts
+        .next()
+        .ok_or_else(|| "missing request http version".to_string())?;
+
+    let mut content_len = None;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_len = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|e| format!("bad content-length: {e}"))?,
+                );
+            }
+        }
+    }
+    let content_len = content_len.ok_or_else(|| "missing content-length".to_string())?;
+    let fast_path = h1_batch_fast_path(path);
+    let total_len = (header_end + 4)
+        .checked_add(content_len)
+        .ok_or_else(|| "request length overflow".to_string())?;
+    if buf.len() < total_len {
+        return Ok(None);
+    }
+
+    let req_bytes = buf.split_to(total_len).freeze();
+    let body = req_bytes.slice((header_end + 4)..total_len);
+    Ok(Some(H1BatchParsedRequest {
+        fast_path,
+        method,
+        content_len,
+        body,
+    }))
+}
+
+async fn write_h1_batch_reply(
+    stream: &mut tokio::net::TcpStream,
+    reply: H1BatchReply,
+) -> anyhow::Result<()> {
+    match reply {
+        H1BatchReply::Binary(bin) => {
+            debug_assert_eq!(bin.len(), 40, "batch ack must stay fixed-size");
+            stream.write_all(H1_BATCH_ACK_PREFIX).await?;
+            stream.write_all(bin.as_ref()).await?;
+        }
+        H1BatchReply::Text(status, msg) => {
+            let reason = status.canonical_reason().unwrap_or("Error");
+            let head = format!(
+                "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\n\r\n",
+                status.as_u16(),
+                reason,
+                msg.len(),
+                H1_TEXT_PREFIX_CONTENT_TYPE
+            );
+            stream.write_all(head.as_bytes()).await?;
+            stream.write_all(msg.as_bytes()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn serve_h1_batch_dataplane_conn(
+    mut stream: tokio::net::TcpStream,
+    st: AppState,
+) -> anyhow::Result<()> {
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
+        write_h1_batch_reply(
+            &mut stream,
+            H1BatchReply::Text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "quickscorer not enabled: start server with --bundle-dir".to_string(),
+            ),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let max_route_record_bytes = expected_dim
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(40))
+        .ok_or_else(|| anyhow::anyhow!("batch route record bytes overflow"))?;
+    let max_body_len = 16usize
+        .checked_add(
+            128usize
+                .checked_mul(max_route_record_bytes)
+                .ok_or_else(|| anyhow::anyhow!("batch max body length overflow"))?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("batch max body length overflow"))?;
+    let max_request_len = MAX_H1_BATCH_HEADER_BYTES
+        .checked_add(max_body_len)
+        .ok_or_else(|| anyhow::anyhow!("batch max request length overflow"))?;
+
+    let mut buf = BytesMut::with_capacity(max_request_len);
+
+    loop {
+        let req = loop {
+            match parse_h1_batch_request_from_buf(&mut buf) {
+                Ok(Some(req)) => break req,
+                Ok(None) => {
+                    if buf.len() >= max_request_len {
+                        write_h1_batch_reply(
+                            &mut stream,
+                            H1BatchReply::Text(
+                                StatusCode::BAD_REQUEST,
+                                "request too large for batch data plane".to_string(),
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    let n = stream.read_buf(&mut buf).await?;
+                    if n == 0 {
+                        if buf.is_empty() {
+                            return Ok(());
+                        }
+                        write_h1_batch_reply(
+                            &mut stream,
+                            H1BatchReply::Text(
+                                StatusCode::BAD_REQUEST,
+                                "truncated h1 batch request".to_string(),
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+                Err(msg) => {
+                    write_h1_batch_reply(
+                        &mut stream,
+                        H1BatchReply::Text(StatusCode::BAD_REQUEST, msg),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        };
+
+        if req.method != Method::POST {
+            write_h1_batch_reply(
+                &mut stream,
+                H1BatchReply::Text(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method not allowed".to_string(),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let Some(fast_path) = req.fast_path else {
+            write_h1_batch_reply(
+                &mut stream,
+                H1BatchReply::Text(StatusCode::NOT_FOUND, "not found".to_string()),
+            )
+            .await?;
+            return Ok(());
+        };
+
+        let _permit = match st.bench_in_flight.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                write_h1_batch_reply(
+                    &mut stream,
+                    H1BatchReply::Text(StatusCode::TOO_MANY_REQUESTS, "overloaded".to_string()),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let reply =
+            execute_h1_batch_fast_request(&st, fast_path, Some(req.content_len), req.body).await;
+        let should_close = matches!(&reply, H1BatchReply::Text(_, _));
+        write_h1_batch_reply(&mut stream, reply).await?;
+        if should_close {
+            return Ok(());
+        }
+    }
+}
+
+fn spawn_h1_batch_dataplane_shards(
+    shard_count: usize,
+    st: AppState,
+) -> Vec<mpsc::UnboundedSender<std::net::TcpStream>> {
+    let mut senders = Vec::with_capacity(shard_count.max(1));
+    for shard_idx in 0..shard_count.max(1) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<std::net::TcpStream>();
+        let st2 = st.clone();
+        std::thread::Builder::new()
+            .name(format!("h1-batch-dp-{shard_idx}"))
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build h1 batch dataplane runtime");
+                rt.block_on(async move {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    loop {
+                        tokio::select! {
+                            Some(std_stream) = rx.recv() => {
+                                let st3 = st2.clone();
+                                tasks.spawn(async move {
+                                    match tokio::net::TcpStream::from_std(std_stream) {
+                                        Ok(stream) => {
+                                            if let Err(e) = serve_h1_batch_dataplane_conn(stream, st3).await {
+                                                warn!(error = %e, shard = shard_idx, "h1 batch dataplane conn failed");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, shard = shard_idx, "convert batch dataplane stream failed");
+                                        }
+                                    }
+                                });
+                            }
+                            Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+                                if let Err(e) = joined {
+                                    warn!(error = %e, shard = shard_idx, "h1 batch dataplane task join failed");
+                                }
+                            }
+                            else => break,
+                        }
+                    }
+                    while let Some(joined) = tasks.join_next().await {
+                        if let Err(e) = joined {
+                            warn!(error = %e, shard = shard_idx, "h1 batch dataplane task join failed");
+                        }
+                    }
+                });
+            })
+            .expect("spawn h1 batch dataplane shard");
+        senders.push(tx);
+    }
+    senders
+}
+
 async fn read_fixed_body(mut body: Incoming, content_len: usize) -> Result<Bytes, String> {
     let mut buf = BytesMut::with_capacity(content_len);
     while let Some(frame) = body.frame().await {
@@ -974,6 +1280,58 @@ fn score_dense_batch_parse_only_request_http_ack_v1_batch128(
     )))
 }
 
+async fn execute_h1_batch_fast_request(
+    st: &AppState,
+    fast_path: H1BatchFastPath,
+    content_len: Option<usize>,
+    body: Bytes,
+) -> H1BatchReply {
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
+        return H1BatchReply::Text(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "quickscorer not enabled: start server with --bundle-dir".to_string(),
+        );
+    };
+
+    let outcome = if let Some(shape) =
+        content_len.and_then(|len| batch128_shape_for_content_len(expected_dim, len))
+    {
+        match fast_path {
+            H1BatchFastPath::Score => score_dense_batch_binary_request_http_ack_v1_batch128(
+                st,
+                body,
+                shape.has_route_meta,
+                shape.record_bytes,
+            ),
+            H1BatchFastPath::Null => score_dense_batch_null_request_http_ack_v1_batch128(
+                body.as_ref(),
+                shape.has_route_meta,
+                shape.record_bytes,
+            ),
+            H1BatchFastPath::ParseOnly => {
+                score_dense_batch_parse_only_request_http_ack_v1_batch128(
+                    body,
+                    shape.has_route_meta,
+                    shape.record_bytes,
+                )
+            }
+        }
+    } else {
+        match fast_path {
+            H1BatchFastPath::Score => score_dense_batch_binary_request_http_ack_v1(st, body).await,
+            H1BatchFastPath::Null => score_dense_batch_null_request_http_ack_v1(st, body),
+            H1BatchFastPath::ParseOnly => {
+                score_dense_batch_parse_only_request_http_ack_v1(st, body)
+            }
+        }
+    };
+
+    match outcome {
+        Ok(bin) => H1BatchReply::Binary(bin),
+        Err((status, msg)) => H1BatchReply::Text(status, msg),
+    }
+}
+
 async fn handle_h1_batch_fast_request(
     st: AppState,
     fast_path: H1BatchFastPath,
@@ -1005,37 +1363,7 @@ async fn handle_h1_batch_fast_request(
         content_len.and_then(|len| batch128_shape_for_content_len(expected_dim, len))
     {
         match read_fixed_body(body, shape.content_len).await {
-            Ok(body) => {
-                let outcome = match fast_path {
-                    H1BatchFastPath::Score => {
-                        score_dense_batch_binary_request_http_ack_v1_batch128(
-                            &st,
-                            body,
-                            shape.has_route_meta,
-                            shape.record_bytes,
-                        )
-                    }
-                    H1BatchFastPath::Null => score_dense_batch_null_request_http_ack_v1_batch128(
-                        body.as_ref(),
-                        shape.has_route_meta,
-                        shape.record_bytes,
-                    ),
-                    H1BatchFastPath::ParseOnly => {
-                        score_dense_batch_parse_only_request_http_ack_v1_batch128(
-                            body,
-                            shape.has_route_meta,
-                            shape.record_bytes,
-                        )
-                    }
-                };
-                return match outcome {
-                    Ok(bin) => batch_binary_response(bin),
-                    Err((status, msg)) => {
-                        error!(error = %msg, "h1 batch fixed128 fast path failed");
-                        text_status_response(status, msg)
-                    }
-                };
-            }
+            Ok(body) => body,
             Err(msg) => return text_status_response(StatusCode::BAD_REQUEST, msg),
         }
     } else {
@@ -1050,15 +1378,9 @@ async fn handle_h1_batch_fast_request(
         }
     };
 
-    let outcome = match fast_path {
-        H1BatchFastPath::Score => score_dense_batch_binary_request_http_ack_v1(&st, body).await,
-        H1BatchFastPath::Null => score_dense_batch_null_request_http_ack_v1(&st, body),
-        H1BatchFastPath::ParseOnly => score_dense_batch_parse_only_request_http_ack_v1(&st, body),
-    };
-
-    match outcome {
-        Ok(bin) => batch_binary_response(bin),
-        Err((status, msg)) => {
+    match execute_h1_batch_fast_request(&st, fast_path, content_len, body).await {
+        H1BatchReply::Binary(bin) => batch_binary_response(bin),
+        H1BatchReply::Text(status, msg) => {
             error!(error = %msg, "h1 batch fast path failed");
             text_status_response(status, msg)
         }
@@ -1530,6 +1852,8 @@ async fn async_main(
     let addr = SocketAddr::from_str(&args.listen).context("invalid --listen")?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("listening on http://{}", addr);
+    let h1_batch_shards = spawn_h1_batch_dataplane_shards(worker_threads.max(1), st.clone());
+    let mut next_h1_batch_shard = 0usize;
 
     if let Some(h2_addr) = args.bench3_h2_listen.as_ref() {
         let h2_addr = SocketAddr::from_str(h2_addr).context("invalid --bench3-h2-listen")?;
@@ -1544,6 +1868,22 @@ async fn async_main(
     loop {
         let (stream, peer) = listener.accept().await.context("accept h1 connection")?;
         stream.set_nodelay(true).ok();
+        if let Some(_) = maybe_peek_h1_batch_fast_path(&stream)
+            .await
+            .context("peek h1 batch path")?
+        {
+            let shard_idx = next_h1_batch_shard % h1_batch_shards.len().max(1);
+            next_h1_batch_shard = next_h1_batch_shard.wrapping_add(1);
+            let std_stream = stream
+                .into_std()
+                .context("convert h1 batch stream to std")?;
+            if h1_batch_shards[shard_idx].send(std_stream).is_err() {
+                return Err(anyhow::anyhow!(
+                    "h1 batch dataplane shard {shard_idx} is closed"
+                ));
+            }
+            continue;
+        }
         let st2 = st.clone();
         let app2 = app.clone();
         tokio::spawn(async move {

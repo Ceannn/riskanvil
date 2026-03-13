@@ -11,9 +11,9 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-mod exp_l2_7945hx;
+mod exp_l2_zen4;
 mod l2_exp_v1;
-mod l2_kernel_7945hx;
+mod l2_kernel_zen4;
 mod qs_exact;
 
 const MAGIC_SOA: &[u8] = b"L1SOAv1\0";
@@ -48,7 +48,7 @@ enum Command {
     RepackL2RuntimeV2(RepackL2RuntimeV2Args),
     RepackL2RuntimeV3(RepackL2RuntimeV3Args),
     RepackL2ExpV1(RepackL2ExpV1Args),
-    RepackL2Kernel7945hxV1(RepackL2Kernel7945hxV1Args),
+    RepackL2KernelZen4V1(RepackL2KernelZen4V1Args),
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -333,7 +333,7 @@ struct RepackL2ExpV1Args {
 }
 
 #[derive(Parser, Debug)]
-struct RepackL2Kernel7945hxV1Args {
+struct RepackL2KernelZen4V1Args {
     #[arg(long)]
     bundle_manifest: PathBuf,
     #[arg(long)]
@@ -808,7 +808,7 @@ enum PrefixV4Mode {
 
 include!("prefix.rs");
 include!("prefix_v2.rs");
-include!("l2_kernel_7945hx/mod.rs");
+include!("l2_kernel_zen4/mod.rs");
 include!("prefix_exec.rs");
 include!("l1.rs");
 include!("commands.rs");

@@ -1,4 +1,4 @@
-const KERNEL_7945HX_V1_DIR: &str = "l2_kernel_7945hx_v1";
+const KERNEL_ZEN4_V1_DIR: &str = "l2_kernel_zen4_v1";
 
 pub(crate) fn repack_from_bundle_manifest(
     bundle_manifest: &std::path::PathBuf,
@@ -39,7 +39,7 @@ pub(crate) fn repack_from_bundle_manifest(
         resolved
             .qs_pack
             .parent()
-            .map(|p| p.join(KERNEL_7945HX_V1_DIR))
+            .map(|p| p.join(KERNEL_ZEN4_V1_DIR))
     });
     crate::l2_exp_v1::repack_from_bundle_manifest(bundle_manifest, out_dir.as_ref())
 }
@@ -50,8 +50,8 @@ pub(crate) fn load_from_resolved_bundle(
     let exp_dir = resolved
         .qs_pack
         .parent()
-        .map(|p| p.join(KERNEL_7945HX_V1_DIR))
-        .unwrap_or_else(|| std::path::PathBuf::from(KERNEL_7945HX_V1_DIR));
+        .map(|p| p.join(KERNEL_ZEN4_V1_DIR))
+        .unwrap_or_else(|| std::path::PathBuf::from(KERNEL_ZEN4_V1_DIR));
     crate::l2_exp_v1::load_from_manifest_dir(&exp_dir)
 }
 

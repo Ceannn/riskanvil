@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     experimental_l2: bool,
     #[arg(long, default_value_t = false)]
-    l2_kernel_7945hx_v1: bool,
+    l2_kernel_zen4_v1: bool,
     #[arg(long, default_value_t = false)]
     standalone_l2: bool,
     #[arg(long, default_value_t = false)]
@@ -312,7 +312,7 @@ fn run_l2_bench(
     if cli.standalone_l2 {
         return run_l2_bench_standalone(cli, dense, route_meta, pprof_cfg);
     }
-    let use_dedicated = cli.l2_kernel_7945hx_v1 || cli.experimental_l2;
+    let use_dedicated = cli.l2_kernel_zen4_v1 || cli.experimental_l2;
     let route_meta =
         route_meta.ok_or_else(|| anyhow!("--route-meta-tsv is required for mode=l2"))?;
     let runtime = MinpackRuntime::load(&cli.bundle_dir)?;
@@ -350,7 +350,7 @@ fn run_l2_bench(
     let measure_rows = cli.measure_rows.min(candidate_rows);
     for (row, fold, tau) in prepared.iter().take(warmup_rows) {
         let out = if use_dedicated {
-            runtime.predict_l2_row_nomiss_experimental_7945hx(row.as_slice(), *tau, *fold)?
+            runtime.predict_l2_row_nomiss_experimental_zen4(row.as_slice(), *tau, *fold)?
         } else {
             runtime.predict_l2_row_nomiss(row.as_slice(), *tau, *fold)?
         };
@@ -367,7 +367,7 @@ fn run_l2_bench(
         let mut review = 0usize;
         for (row, fold, tau) in prepared.iter().take(measure_rows) {
             let out = if use_dedicated {
-                runtime.predict_l2_row_nomiss_experimental_7945hx(row.as_slice(), *tau, *fold)?
+                runtime.predict_l2_row_nomiss_experimental_zen4(row.as_slice(), *tau, *fold)?
             } else {
                 runtime.predict_l2_row_nomiss(row.as_slice(), *tau, *fold)?
             };
@@ -411,7 +411,7 @@ fn run_mixed_bench(
     if cli.standalone_l2 {
         return run_mixed_bench_standalone(cli, dense, route_meta, pprof_cfg);
     }
-    let use_dedicated = cli.l2_kernel_7945hx_v1 || cli.experimental_l2;
+    let use_dedicated = cli.l2_kernel_zen4_v1 || cli.experimental_l2;
     let route_meta =
         route_meta.ok_or_else(|| anyhow!("--route-meta-tsv is required for mode=mixed"))?;
     let engine = (!use_dedicated)
@@ -441,7 +441,7 @@ fn run_mixed_bench(
                     &mut l2_row,
                 );
                 std::hint::black_box(
-                    runtime.predict_l2_row_nomiss_experimental_7945hx(
+                    runtime.predict_l2_row_nomiss_experimental_zen4(
                         l2_row.as_slice(),
                         meta.l2_tau_used
                             .expect("route meta must carry l2_tau_used in experimental mode"),
@@ -489,7 +489,7 @@ fn run_mixed_bench(
                         l2_policy,
                         &mut l2_row,
                     );
-                    let l2_out = runtime.predict_l2_row_nomiss_experimental_7945hx(
+                    let l2_out = runtime.predict_l2_row_nomiss_experimental_zen4(
                         l2_row.as_slice(),
                         meta.l2_tau_used
                             .expect("route meta must carry l2_tau_used in experimental mode"),

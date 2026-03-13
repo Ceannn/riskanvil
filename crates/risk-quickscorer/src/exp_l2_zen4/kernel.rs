@@ -7,9 +7,9 @@ use super::super::{
 };
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ExperimentalL2Kernel7945hx;
+pub(crate) struct ExperimentalL2KernelZen4;
 
-impl ExperimentalL2Kernel7945hx {
+impl ExperimentalL2KernelZen4 {
     pub(crate) fn new(runtime: &LoadedPrefixRuntime) -> Option<Self> {
         let direct_ok = matches!(
             runtime.direct_kernel,
@@ -46,7 +46,7 @@ impl ExperimentalL2Kernel7945hx {
             runtime, row, row_tau, row_fold, hot_buf, ranks,
         )?
         else {
-            bail!("experimental 7945HX L2 kernel unavailable for current runtime");
+            bail!("experimental ZEN4 L2 kernel unavailable for current runtime");
         };
 
         if !shadow.fallback_used {

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::OnceLock;
 use tracing::{info, trace};
-use crate::exp_l2_7945hx::ExperimentalL2Kernel7945hx;
+use crate::exp_l2_zen4::ExperimentalL2KernelZen4;
 use crate::l2_exp_v1::{ExpHotStageBuf, L2ExpV1Runtime};
 
 thread_local! {
@@ -142,9 +142,9 @@ struct OnlineL1Runtime {
 struct OnlineL2Runtime {
     model: SoaModel,
     runtime: LoadedPrefixRuntime,
-    experimental_7945hx: Option<ExperimentalL2Kernel7945hx>,
+    experimental_zen4: Option<ExperimentalL2KernelZen4>,
     exp_v1: Option<L2ExpV1Runtime>,
-    kernel_7945hx_v1: Option<L2ExpV1Runtime>,
+    kernel_zen4_v1: Option<L2ExpV1Runtime>,
 }
 
 #[derive(Debug)]
@@ -226,7 +226,7 @@ impl MinpackRuntime {
         let l2_bounds = load_bounds(&resolved.bounds)?;
         let mut l2_runtime = load_prefix_runtime(&resolved, &l2_soa, &l2_bounds)?;
         let l2_exp_v1 = l2_exp_v1::load_from_resolved_bundle(&resolved)?;
-        let l2_kernel_7945hx_v1 = l2_kernel_7945hx::load_from_resolved_bundle(&resolved)?;
+        let l2_kernel_zen4_v1 = l2_kernel_zen4::load_from_resolved_bundle(&resolved)?;
         l2_runtime.trim_for_online();
         let l2_dim = load_feature_names_from_json(&l2_model_dir.join("feature_names.json"))?.len();
         log_load_mem("runtime_load_after_l2");
@@ -242,9 +242,9 @@ impl MinpackRuntime {
             },
             l2: OnlineL2Runtime {
                 model: l2_soa,
-                experimental_7945hx: ExperimentalL2Kernel7945hx::new(&l2_runtime),
+                experimental_zen4: ExperimentalL2KernelZen4::new(&l2_runtime),
                 exp_v1: l2_exp_v1,
-                kernel_7945hx_v1: l2_kernel_7945hx_v1,
+                kernel_zen4_v1: l2_kernel_zen4_v1,
                 runtime: l2_runtime,
             },
             l1_dim,
@@ -257,7 +257,7 @@ impl MinpackRuntime {
 
     #[inline]
     pub fn backend_name(&self) -> &'static str {
-        "rust_quickscorer_7945hx"
+        "rust_quickscorer_zen4"
     }
 
     #[inline]
@@ -785,7 +785,7 @@ impl MinpackRuntime {
         })
     }
 
-    pub fn predict_l2_row_nomiss_experimental_7945hx(
+    pub fn predict_l2_row_nomiss_experimental_zen4(
         &self,
         row: &[f32],
         row_tau: f32,
@@ -794,11 +794,11 @@ impl MinpackRuntime {
         if row.len() != self.l2_dim {
             bail!("l2 row len mismatch: got={} expected={}", row.len(), self.l2_dim);
         }
-        if let Some(exp) = self.l2.kernel_7945hx_v1.as_ref() {
+        if let Some(exp) = self.l2.kernel_zen4_v1.as_ref() {
             return ONLINE_TLS_SCRATCH.with(|cell| -> Result<OnlineL2Output> {
                 let mut scratch = cell.borrow_mut();
                 let (hot_buf, local_ranks) = scratch.ensure_l2_exp(exp);
-                l2_kernel_7945hx::predict_nomiss(
+                l2_kernel_zen4::predict_nomiss(
                     exp,
                     &self.l2.runtime,
                     row,
@@ -826,13 +826,13 @@ impl MinpackRuntime {
         }
         let kernel = self
             .l2
-            .experimental_7945hx
-            .ok_or_else(|| anyhow::anyhow!("experimental 7945HX L2 kernel unavailable"))?;
+            .experimental_zen4
+            .ok_or_else(|| anyhow::anyhow!("experimental ZEN4 L2 kernel unavailable"))?;
         ONLINE_TLS_SCRATCH.with(|cell| -> Result<OnlineL2Output> {
             let mut scratch = cell.borrow_mut();
             let (hot_buf, ranks) = scratch
                 .ensure_l2_nomiss_fast(&self.l2.runtime)
-                .ok_or_else(|| anyhow::anyhow!("experimental 7945HX L2 hot path unavailable"))?;
+                .ok_or_else(|| anyhow::anyhow!("experimental ZEN4 L2 hot path unavailable"))?;
             kernel.predict_nomiss(&self.l2.runtime, &self.l2.model, row, row_tau, row_fold, hot_buf, ranks)
         })
     }

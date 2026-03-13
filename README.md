@@ -1,62 +1,49 @@
 # Riskanvil
 
-`riskanvil` is a Rust workspace for high-throughput tree-model inference and serving.
+Riskanvil is a Rust workspace for high-throughput tree-model inference and batch serving.
 
-This public snapshot keeps the parts that matter for the systems story:
+This repository was built around a simple requirement: if the model is large, the runtime still has to move. It keeps the inference runtime, two server implementations, and the benchmark client needed to push the whole stack instead of stopping at toy examples.
 
-- an inference core for dense row scoring
-- a QuickScorer-oriented L1 runtime
-- a standalone L2 runtime
-- two HTTP servers
-- a throughput benchmark client
+## Performance Snapshot
 
-What is *not* included:
+Representative results from this line of work:
 
-- private training pipelines
-- PT / parquet / raw datasets
-- internal model bundles and release artifacts
-- abandoned side tracks that were only useful during local iteration
+- L1 runtime: about `503K rows/s` single-core median
+- standalone L2 runtime: about `621K rows/s` single-core median
+- end-to-end HTTP batch path: pushed past `400K rows/s`
+- clean `420K rows/s` pass observed on the optimized batch-serving line
 
-The result is a smaller workspace that can be read, built, and profiled without dragging the private project along with it.
+These numbers come from actual serving-oriented optimization work, not from a tiny isolated kernel demo that ignores the rest of the system.
+
+## Highlights
+
+- QuickScorer-oriented L1 runtime in Rust
+- standalone L2 runtime and kernel-facing tooling
+- Tokio and Glommio HTTP servers
+- throughput-oriented benchmark client for HTTP batch serving
+- end-to-end path built around dense `f32` batch scoring
+- tuned for large-tree scoring workloads rather than framework aesthetics
 
 ## Workspace
 
 The public workspace contains six crates:
 
 - `crates/risk-core`
-  - shared scoring pipeline, schema, routing, and server-facing integration points
+  - shared schema, pipeline, routing, and server-facing scoring integration
 - `crates/risk-quickscorer`
-  - QuickScorer-oriented L1 runtime and supporting execution code
+  - QuickScorer-oriented L1 runtime and execution support
 - `crates/risk-quickscorer-standalone-l2`
-  - standalone L2 runtime and kernel-facing tooling
+  - standalone L2 runtime and kernel-adjacent tooling
 - `crates/risk-server-tokio`
-  - Tokio HTTP server
+  - Tokio-based HTTP server
 - `crates/risk-server-glommio`
-  - Glommio HTTP server
+  - Glommio-based HTTP server
 - `crates/risk-bench3`
-  - high-rate benchmark client used for end-to-end throughput work
+  - high-rate throughput benchmark client
 
-## What This Repo Is
+## Main End-to-End Path
 
-This is not a polished product server.
-
-It is a working systems codebase that grew around one question:
-
-> how far can a tree-model scoring stack be pushed when the kernel is fast enough that the bottleneck moves into serving?
-
-That question ended up touching:
-
-- model-side execution layout
-- L1 / L2 runtime design
-- HTTP batch serving
-- benchmark-client behavior
-- request lifecycle and completion turnover
-
-The code reflects that history. Some crates are compact and clean. Some hot paths are intentionally dense. The public version keeps the useful parts of that work without pretending everything is a general-purpose framework.
-
-## Main Throughput Path
-
-The main end-to-end path in this workspace is:
+The main throughput path in this repository is:
 
 - server: `risk-server-tokio`
 - client: `risk-bench3`
@@ -64,7 +51,9 @@ The main end-to-end path in this workspace is:
 - endpoint: `/score_dense_f32_batch_v1`
 - batch shape: `batch_records = 128`
 
-This is the path the later serving work was optimized around.
+This is the path the serving work was organized around.
+
+This repository is here to show a tree-model stack that actually moves, not a server that merely compiles.
 
 ## Build
 
@@ -85,23 +74,23 @@ Build release binaries:
 cargo build --release -p risk-server-tokio -p risk-server-glommio -p risk-bench3
 ```
 
-## Minimal Startup
+## Minimal Usage
 
-Tokio server:
+Start the Tokio server:
 
 ```bash
 cargo run -p risk-server-tokio -- \
   --listen 127.0.0.1:8080
 ```
 
-Glommio server:
+Start the Glommio server:
 
 ```bash
 cargo run -p risk-server-glommio -- \
   --listen 127.0.0.1:8080
 ```
 
-Bench client:
+Run the benchmark client:
 
 ```bash
 cargo run -p risk-bench3 -- \
@@ -111,53 +100,35 @@ cargo run -p risk-bench3 -- \
   --batch-records 128
 ```
 
-The benchmark expects local dense-row inputs and route metadata. Those artifacts are intentionally not shipped in this public repo.
+To run the full scoring path you will need a local model bundle and local dense-row inputs.
 
-## Notes On Artifacts
+## Design
 
-This repository does not include model bundles or production data.
+Riskanvil is split into three layers:
 
-If you want to run the end-to-end path for real, you will need to provide your own:
+1. inference runtimes
+   - `risk-quickscorer`
+   - `risk-quickscorer-standalone-l2`
+2. shared pipeline and schema
+   - `risk-core`
+3. serving and end-to-end measurement
+   - `risk-server-tokio`
+   - `risk-server-glommio`
+   - `risk-bench3`
 
-- QuickScorer bundle directory
-- dense row input file
-- optional route metadata file
+This separation keeps kernel-facing code, pipeline code, and server/runtime code in different places even when they are tuned against the same workload.
 
-The code paths remain here; the private artifacts do not.
+## Scope
 
-## Design Shape
+This repository is focused on inference and serving:
 
-The public snapshot keeps a clear separation between three layers:
+- kernel-adjacent runtime work
+- HTTP batch scoring
+- throughput benchmarking
 
-1. `risk-quickscorer` and `risk-quickscorer-standalone-l2`
-   - kernel-adjacent inference runtimes
-2. `risk-core`
-   - pipeline and schema layer
-3. `risk-server-*` and `risk-bench3`
-   - serving and end-to-end throughput tooling
+It optimizes for hot-path behavior, explicit ownership, and measurable throughput.
 
-That split is deliberate. The inference core and the serving runtime are related, but they are not the same optimization problem.
-
-## Why The Code Looks The Way It Does
-
-Some files in this repo are straightforward. Some are not.
-
-That is mostly a consequence of the target:
-
-- fixed-shape batch scoring
-- hot-path memory control
-- explicit ownership over request progression
-- low tolerance for abstraction overhead in kernel-adjacent code
-
-Rust helps here by making the unsafe and performance-sensitive regions explicit instead of letting the whole codebase decay into one giant undefined-behavior zone.
-
-## Status
-
-This repository is best read as a compact public cut of a larger private workspace.
-
-It is stable enough to build and inspect.
-It is honest enough to show the real hot paths.
-It is small enough to publish without shipping the private baggage.
+It is not a general web framework or a product application template.
 
 ## License
 

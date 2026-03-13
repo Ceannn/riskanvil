@@ -229,13 +229,13 @@ fn run_repack_l2_exp_v1(args: RepackL2ExpV1Args) -> Result<()> {
     Ok(())
 }
 
-fn run_repack_l2_kernel_7945hx_v1(args: RepackL2Kernel7945hxV1Args) -> Result<()> {
-    let manifest_path = l2_kernel_7945hx::repack_from_bundle_manifest(
+fn run_repack_l2_kernel_zen4_v1(args: RepackL2KernelZen4V1Args) -> Result<()> {
+    let manifest_path = l2_kernel_zen4::repack_from_bundle_manifest(
         &args.bundle_manifest,
         args.output_dir.as_ref(),
     )?;
     info!(
-        "repack_l2_kernel_7945hx_v1 bundle_manifest={} manifest={}",
+        "repack_l2_kernel_zen4_v1 bundle_manifest={} manifest={}",
         args.bundle_manifest.display(),
         manifest_path.display()
     );
@@ -2398,6 +2398,6 @@ pub fn run_cli() -> Result<()> {
         Command::RepackL2RuntimeV2(args) => run_repack_l2_runtime_v2(args),
         Command::RepackL2RuntimeV3(args) => run_repack_l2_runtime_v3(args),
         Command::RepackL2ExpV1(args) => run_repack_l2_exp_v1(args),
-        Command::RepackL2Kernel7945hxV1(args) => run_repack_l2_kernel_7945hx_v1(args),
+        Command::RepackL2KernelZen4V1(args) => run_repack_l2_kernel_zen4_v1(args),
     }
 }

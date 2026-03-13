@@ -1,20 +1,20 @@
 use serde::{Deserialize, Serialize};
 
-/// 运行时配置：后续可以换成文件读取 / 动态热更。
+/// Runtime configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// 端到端预算（用于 Router 的 deadline / 超时降级）
+    /// End-to-end budget used by router deadline and fallback logic.
     pub slo_p99_ms: u64,
 
-    /// L1 不确定区间：落在 (low, high) 的样本才会触发 L2/L3
+    /// L1 uncertainty band. Samples in (low, high) may escalate to deeper stages.
     pub l1_uncertain_low: f64,
     pub l1_uncertain_high: f64,
 
-    /// 风险阈值（用于 decision）
+    /// Decision thresholds.
     pub deny_threshold: f64,
     pub review_threshold: f64,
 
-    /// FeatureStore：滑窗参数（秒）
+    /// Feature store window sizes, in seconds.
     pub win_60s: u64,
     pub win_300s: u64,
 }

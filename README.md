@@ -1,38 +1,135 @@
-# Monster Risk (Tokio starter)
+# Riskanvil
 
-这是一个“先跑通最小闭环、再逐步变 monster”的风控实时评分系统原型骨架（Tokio 版）。
-目标：**端到端 SLO p99 <= 10ms**（先跑通，再逐步优化；之后会加 Glommio 版做 p99 对比）。
+Riskanvil is a Rust workspace for high-throughput tree-model inference and batch serving.
 
-## Quickstart
+This repository was built around a simple requirement: if the model is large, the runtime still has to move. It keeps the inference runtime, two server implementations, and the benchmark client needed to push the whole stack instead of stopping at toy examples.
+
+## Performance Snapshot
+
+Representative results from this line of work:
+
+- L1 runtime: about `503K rows/s` single-core median
+- standalone L2 runtime: about `621K rows/s` single-core median
+- end-to-end HTTP batch path: pushed past `400K rows/s`
+- clean `420K rows/s` pass observed on the optimized batch-serving line
+
+These numbers come from actual serving-oriented optimization work, not from a tiny isolated kernel demo that ignores the rest of the system.
+
+## Highlights
+
+- QuickScorer-oriented L1 runtime in Rust
+- standalone L2 runtime and kernel-facing tooling
+- Tokio and Glommio HTTP servers
+- throughput-oriented benchmark client for HTTP batch serving
+- end-to-end path built around dense `f32` batch scoring
+- tuned for large-tree scoring workloads rather than framework aesthetics
+
+## Workspace
+
+The public workspace contains six crates:
+
+- `crates/risk-core`
+  - shared schema, pipeline, routing, and server-facing scoring integration
+- `crates/risk-quickscorer`
+  - QuickScorer-oriented L1 runtime and execution support
+- `crates/risk-quickscorer-standalone-l2`
+  - standalone L2 runtime and kernel-adjacent tooling
+- `crates/risk-server-tokio`
+  - Tokio-based HTTP server
+- `crates/risk-server-glommio`
+  - Glommio-based HTTP server
+- `crates/risk-bench3`
+  - high-rate throughput benchmark client
+
+## Main End-to-End Path
+
+The main throughput path in this repository is:
+
+- server: `risk-server-tokio`
+- client: `risk-bench3`
+- transport: `HTTP/1.1 keepalive`
+- endpoint: `/score_dense_f32_batch_v1`
+- batch shape: `batch_records = 128`
+
+This is the path the serving work was organized around.
+
+This repository is here to show a tree-model stack that actually moves, not a server that merely compiles.
+
+## Build
+
+Check the public workspace:
 
 ```bash
-# 1) 启动服务（默认 127.0.0.1:8080）
-cargo run -p risk-server-tokio
-
-# 2) 压测（固定速率，默认 1000 rps，20s）
-cargo run -p risk-bench -- --rps 1000 --duration 20
+cargo check -p risk-core \
+  -p risk-quickscorer \
+  -p risk-quickscorer-standalone-l2 \
+  -p risk-server-tokio \
+  -p risk-server-glommio \
+  -p risk-bench3
 ```
 
-- 评分接口：POST `http://127.0.0.1:8080/score`
-- 指标接口：GET  `http://127.0.0.1:8080/metrics`
+Build release binaries:
 
-## Example request
-
-```json
-{
-  "trace_id": null,
-  "event_time_ms": 1735344000123,
-  "user_id": "u_42",
-  "card_id": "c_42",
-  "merchant_id": "m_7",
-  "mcc": 5411,
-  "amount": 128.50,
-  "currency": "JPY",
-  "country": "JP",
-  "channel": "ECOM",
-  "device_id": "d_1",
-  "ip_prefix": "203.0.113",
-  "is_3ds": true
-}
+```bash
+cargo build --release -p risk-server-tokio -p risk-server-glommio -p risk-bench3
 ```
 
+## Minimal Usage
+
+Start the Tokio server:
+
+```bash
+cargo run -p risk-server-tokio -- \
+  --listen 127.0.0.1:8080
+```
+
+Start the Glommio server:
+
+```bash
+cargo run -p risk-server-glommio -- \
+  --listen 127.0.0.1:8080
+```
+
+Run the benchmark client:
+
+```bash
+cargo run -p risk-bench3 -- \
+  --target http://127.0.0.1:8080/score_dense_f32_batch_v1 \
+  --mode throughput \
+  --batch-mode http1 \
+  --batch-records 128
+```
+
+To run the full scoring path you will need a local model bundle and local dense-row inputs.
+
+## Design
+
+Riskanvil is split into three layers:
+
+1. inference runtimes
+   - `risk-quickscorer`
+   - `risk-quickscorer-standalone-l2`
+2. shared pipeline and schema
+   - `risk-core`
+3. serving and end-to-end measurement
+   - `risk-server-tokio`
+   - `risk-server-glommio`
+   - `risk-bench3`
+
+This separation keeps kernel-facing code, pipeline code, and server/runtime code in different places even when they are tuned against the same workload.
+
+## Scope
+
+This repository is focused on inference and serving:
+
+- kernel-adjacent runtime work
+- HTTP batch scoring
+- throughput benchmarking
+
+It optimizes for hot-path behavior, explicit ownership, and measurable throughput.
+
+It is not a general web framework or a product application template.
+
+## License
+
+See [LICENSE](LICENSE).

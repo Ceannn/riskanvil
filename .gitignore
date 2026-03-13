@@ -17,3 +17,43 @@ Thumbs.db
 .vscode/
 .env
 .env.*
+
+/data/
+/models/
+*.zip
+*.diff
+*.Identifier
+
+# datasets & artifacts
+data/
+datasets/
+*.parquet
+
+*.tsv
+# local runtime
+results/
+target/
+*.patch
+*.patch*
+crates/risk-core/native/
+.cache/*
+
+# Track only crates/*; ignore other untracked top-level items.
+/*
+!/crates/
+!/crates/**
+!.gitignore
+/crates/results/
+/crates/risk-bench-lag-delay.patch
+/crates/risk-core/native/
+/crates/risk-server-glommio/src/mamba_runtime.rs
+/DEV_GUIDE/
+/tools/
+/crates/risk-bench/
+/crates/risk-bench2/
+/crates/risk-bench-h2/
+/crates/risk-mamba-kernel/
+/crates/risk-mamba-v1/
+/crates/risk_mamba_runner/
+/crates/tokio-server-batchplane/
+/crates/xgb-ffi/

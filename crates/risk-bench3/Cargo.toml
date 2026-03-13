@@ -1,0 +1,22 @@
+[package]
+name = "risk-bench3"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+futures-util = "0.3"
+hdrhistogram = "7"
+h2 = "0.4"
+http = "1"
+libc = "0.2"
+memmap2 = "0.9"
+mio = { version = "1", features = ["os-poll", "net"] }
+rand = { version = "0.8", features = ["small_rng"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt","net","time","sync","io-util"] }

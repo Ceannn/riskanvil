@@ -1,225 +1,754 @@
+use crate::quickscorer::{QuickL1PredictOutput, QuickRouteMeta, QuickScorerEngine};
 use crate::{
     config::Config,
-    feature_store::FeatureStore,
-    model::Models,
-    schema::{Decision, ReasonItem, ScoreRequest, ScoreResponse, TimingsUs},
-    util::now_us,
+    schema::{ReasonItem, ScoreResponse, TimingsUs},
+    util::{mix_u64, now_us},
 };
+
+use anyhow::Context;
+use bytes::Bytes;
+use risk_quickscorer_standalone_l2::{StandaloneL2Runtime, StandaloneL2Scratch};
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+pub struct BatchScoreLite {
+    pub decision: crate::schema::Decision,
+    pub used_l2: bool,
+}
+
+#[derive(Debug)]
+struct RateBudget {
+    limit_per_sec: u64,
+    start: Instant,
+    sec: AtomicU64,
+    count: AtomicU64,
+}
+
+impl RateBudget {
+    fn new(limit_per_sec: u64) -> Self {
+        Self {
+            limit_per_sec,
+            start: Instant::now(),
+            sec: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn now_sec(&self) -> u64 {
+        self.start.elapsed().as_secs()
+    }
+
+    fn try_acquire(&self) -> bool {
+        if self.limit_per_sec == 0 {
+            return true;
+        }
+
+        let now = self.now_sec();
+        let cur = self.sec.load(Ordering::Relaxed);
+        if cur != now
+            && self
+                .sec
+                .compare_exchange(cur, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.count.store(0, Ordering::Relaxed);
+        }
+
+        let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        n <= self.limit_per_sec
+    }
+}
+
+thread_local! {
+    static TLS_L2_SAMPLE_RNG: Cell<u64> = const { Cell::new(0) };
+    static TLS_STANDALONE_L2_SCRATCH: RefCell<Option<StandaloneL2Scratch>> = const { RefCell::new(None) };
+}
+
+fn tls_rand_u64() -> u64 {
+    TLS_L2_SAMPLE_RNG.with(|c| {
+        let mut state = c.get();
+        if state == 0 {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let salt = (std::process::id() as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            let addr = (c as *const Cell<u64> as usize) as u64;
+            state = now ^ salt ^ addr;
+        }
+        state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let out = mix_u64(state);
+        c.set(state);
+        out
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum StandaloneL2TauMode {
+    Request,
+    Fixed(f32),
+}
+
+#[derive(Debug)]
+struct L2Control {
+    rate_budget: Option<RateBudget>,
+    max_queue_waterline: f64,
+    min_remaining_us: u64,
+    queue_wait_budget_us: u64,
+    sample_base_ppm: u32,
+    sample_min_ppm: u32,
+    sample_dyn_ppm: AtomicU64,
+    sample_dyn_enable: bool,
+    sample_last_update_ms: AtomicU64,
+    sample_update_ctr: AtomicU64,
+    sample_waterline_target: f64,
+    sample_waterline_hi: f64,
+    sample_waterline_lo: f64,
+    waterline_cached_bits: AtomicU64,
+    start: Instant,
+}
+
+impl L2Control {
+    fn from_env(cfg: &Config) -> Self {
+        fn env_u64(key: &str) -> Option<u64> {
+            std::env::var(key).ok().and_then(|s| s.parse::<u64>().ok())
+        }
+        fn env_f64(key: &str) -> Option<f64> {
+            std::env::var(key).ok().and_then(|s| s.parse::<f64>().ok())
+        }
+        fn clamp01(v: f64) -> f64 {
+            v.clamp(0.0, 1.0)
+        }
+
+        let max_triggers_per_sec = env_u64("ROUTER_L2_MAX_TRIGGERS_PER_SEC").unwrap_or(0);
+        let rate_budget = if max_triggers_per_sec > 0 {
+            Some(RateBudget::new(max_triggers_per_sec))
+        } else {
+            None
+        };
+
+        let max_queue_waterline = env_f64("ROUTER_L2_MAX_QUEUE_WATERLINE").unwrap_or(1.0);
+        let default_min_remaining_us = ((cfg.slo_p99_ms * 1000) / 2).max(1_000);
+        let min_remaining_us =
+            env_u64("ROUTER_L2_MIN_REMAINING_US").unwrap_or(default_min_remaining_us);
+        let queue_wait_budget_us = env_u64("ROUTER_L2_QUEUE_WAIT_BUDGET_US").unwrap_or(0);
+
+        let base_ppm = env_u64("ROUTER_L2_SAMPLE_PPM")
+            .or_else(|| {
+                env_f64("ROUTER_L2_SAMPLE_RATIO")
+                    .map(|v| (v.clamp(0.0, 1.0) * 1_000_000.0).round() as u64)
+            })
+            .unwrap_or(300_000)
+            .min(1_000_000) as u32;
+
+        let mut min_ppm = env_f64("ROUTER_L2_SAMPLE_MIN_RATIO")
+            .map(|v| (v.clamp(0.0, 1.0) * 1_000_000.0).round() as u32)
+            .unwrap_or_else(|| ((base_ppm as f64) * 0.1).round() as u32);
+        if min_ppm > base_ppm {
+            min_ppm = base_ppm;
+        }
+
+        let sample_dyn_enable = env_u64("ROUTER_L2_DYN_ENABLE").unwrap_or(1) != 0;
+        let sample_waterline_target =
+            clamp01(env_f64("ROUTER_L2_WATERLINE_TARGET").unwrap_or(0.60));
+        let mut sample_waterline_hi = clamp01(env_f64("ROUTER_L2_WATERLINE_HI").unwrap_or(0.85));
+        let mut sample_waterline_lo = clamp01(env_f64("ROUTER_L2_WATERLINE_LO").unwrap_or(0.40));
+        if sample_waterline_lo > sample_waterline_hi {
+            std::mem::swap(&mut sample_waterline_lo, &mut sample_waterline_hi);
+        }
+
+        metrics::gauge!("router_l2_sample_ratio").set(base_ppm as f64 / 1_000_000.0);
+
+        Self {
+            rate_budget,
+            max_queue_waterline,
+            min_remaining_us,
+            queue_wait_budget_us,
+            sample_base_ppm: base_ppm,
+            sample_min_ppm: min_ppm,
+            sample_dyn_ppm: AtomicU64::new(base_ppm as u64),
+            sample_dyn_enable,
+            sample_last_update_ms: AtomicU64::new(0),
+            sample_update_ctr: AtomicU64::new(0),
+            sample_waterline_target,
+            sample_waterline_hi,
+            sample_waterline_lo,
+            waterline_cached_bits: AtomicU64::new(0.0f64.to_bits()),
+            start: Instant::now(),
+        }
+    }
+
+    #[inline]
+    fn sample_ppm(&self) -> u32 {
+        if self.sample_dyn_enable {
+            self.sample_dyn_ppm.load(Ordering::Relaxed).min(1_000_000) as u32
+        } else {
+            self.sample_base_ppm
+        }
+    }
+
+    #[inline]
+    fn sample_ratio(&self) -> f64 {
+        self.sample_ppm() as f64 / 1_000_000.0
+    }
+
+    #[inline]
+    fn sample_base_ratio(&self) -> f64 {
+        self.sample_base_ppm as f64 / 1_000_000.0
+    }
+
+    #[inline]
+    fn sample_dyn_ratio(&self) -> f64 {
+        self.sample_dyn_ppm.load(Ordering::Relaxed).min(1_000_000) as f64 / 1_000_000.0
+    }
+
+    #[inline]
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn feedback_overload(&self) {
+        if !self.sample_dyn_enable {
+            return;
+        }
+        let ctr = self.sample_update_ctr.fetch_add(1, Ordering::Relaxed) + 1;
+        if ctr & 31 != 0 {
+            return;
+        }
+
+        let now_ms = self.now_ms();
+        let last = self.sample_last_update_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 50 {
+            return;
+        }
+        if self
+            .sample_last_update_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let cur = self.sample_dyn_ppm.load(Ordering::Relaxed) as u32;
+        let next = ((cur as f64) * 0.7).round() as u32;
+        let next = next.max(self.sample_min_ppm).min(self.sample_base_ppm);
+        if next < cur {
+            self.sample_dyn_ppm.store(next as u64, Ordering::Relaxed);
+            metrics::gauge!("router_l2_sample_ratio").set(next as f64 / 1_000_000.0);
+            crate::batched_counter!("router_l2_feedback_overload_total").increment(1);
+        }
+    }
+
+    fn feedback_relax(&self) {
+        if !self.sample_dyn_enable {
+            return;
+        }
+        let ctr = self.sample_update_ctr.fetch_add(1, Ordering::Relaxed) + 1;
+        if ctr & 127 != 0 {
+            return;
+        }
+
+        let now_ms = self.now_ms();
+        let last = self.sample_last_update_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 200 {
+            return;
+        }
+        if self
+            .sample_last_update_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let cur = self.sample_dyn_ppm.load(Ordering::Relaxed) as u32;
+        if cur >= self.sample_base_ppm {
+            return;
+        }
+        let next = ((cur as f64) * 1.08).round() as u32;
+        let next = next.max(self.sample_min_ppm).min(self.sample_base_ppm);
+        if next > cur {
+            self.sample_dyn_ppm.store(next as u64, Ordering::Relaxed);
+            metrics::gauge!("router_l2_sample_ratio").set(next as f64 / 1_000_000.0);
+            crate::batched_counter!("router_l2_feedback_relax_total").increment(1);
+        }
+    }
+
+    fn feedback_waterline(&self, waterline: f64) {
+        self.waterline_cached_bits
+            .store(waterline.to_bits(), Ordering::Relaxed);
+
+        if self.rate_budget.as_ref().is_some_and(|b| !b.try_acquire()) {
+            self.feedback_overload();
+            return;
+        }
+
+        if waterline >= self.sample_waterline_hi {
+            self.feedback_overload();
+        } else if waterline <= self.sample_waterline_lo {
+            self.feedback_relax();
+        } else {
+            let target = self.sample_waterline_target;
+            let dist = (waterline - target).abs();
+            if dist < 0.03 && (tls_rand_u64() & 0x3f) == 0 {
+                self.feedback_relax();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct L2ControlView {
+    inner: Arc<L2Control>,
+}
+
+impl L2ControlView {
+    #[inline]
+    pub fn sample_ratio(&self) -> f64 {
+        self.inner.sample_ratio()
+    }
+
+    #[inline]
+    pub fn sample_base_ratio(&self) -> f64 {
+        self.inner.sample_base_ratio()
+    }
+
+    #[inline]
+    pub fn sample_dyn_ratio(&self) -> f64 {
+        self.inner.sample_dyn_ratio()
+    }
+
+    #[inline]
+    pub fn sample_waterline_target(&self) -> f64 {
+        self.inner.sample_waterline_target
+    }
+
+    #[inline]
+    pub fn sample_waterline_hi(&self) -> f64 {
+        self.inner.sample_waterline_hi
+    }
+
+    #[inline]
+    pub fn sample_waterline_lo(&self) -> f64 {
+        self.inner.sample_waterline_lo
+    }
+
+    #[inline]
+    pub fn feedback_overload(&self) {
+        self.inner.feedback_overload();
+    }
+
+    #[inline]
+    pub fn feedback_waterline(&self, waterline: f64) {
+        self.inner.feedback_waterline(waterline);
+    }
+
+    #[inline]
+    pub fn max_queue_waterline(&self) -> f64 {
+        self.inner.max_queue_waterline
+    }
+
+    #[inline]
+    pub fn min_remaining_us(&self) -> u64 {
+        self.inner.min_remaining_us
+    }
+
+    #[inline]
+    pub fn queue_wait_budget_us(&self) -> u64 {
+        self.inner.queue_wait_budget_us
+    }
+}
+
+#[inline]
+fn record_serialize_metrics(resp: &mut ScoreResponse) {
+    let ser_hist = crate::sampled_histogram!("stage_serialize_us");
+    if ser_hist.enabled() {
+        let t_ser = Instant::now();
+        let _ = serde_json::to_vec(resp);
+        resp.timings_us.serialize = now_us(t_ser);
+        ser_hist.record(resp.timings_us.serialize as f64);
+    }
+}
+
+#[inline]
+fn record_e2e_metrics(t0: Instant) {
+    crate::sampled_histogram!("e2e_us").record(now_us(t0) as f64);
+}
 
 #[derive(Clone)]
 pub struct AppCore {
     pub cfg: Config,
-    pub store: Arc<FeatureStore>,
-    pub models: Models,
+    pub quick: Option<Arc<QuickScorerEngine>>,
+    l2_ctrl: Arc<L2Control>,
 }
 
 impl AppCore {
     pub fn new(cfg: Config) -> Self {
-        let store = Arc::new(FeatureStore::new(cfg.win_60s, cfg.win_300s));
+        let l2_ctrl = Arc::new(L2Control::from_env(&cfg));
         Self {
             cfg,
-            store,
-            models: Models::default(),
+            quick: None,
+            l2_ctrl,
         }
     }
 
-    pub fn score(&self, req: ScoreRequest) -> ScoreResponse {
+    pub fn new_with_quickscorer_bundle<P: AsRef<Path>>(
+        cfg: Config,
+        bundle_dir: P,
+    ) -> anyhow::Result<Self> {
+        let l2_ctrl = Arc::new(L2Control::from_env(&cfg));
+        let quick = Arc::new(QuickScorerEngine::load(bundle_dir.as_ref())?);
+
+        Ok(Self {
+            cfg,
+            quick: Some(quick),
+            l2_ctrl,
+        })
+    }
+
+    #[inline]
+    pub fn quick_dims(&self) -> Option<(usize, usize)> {
+        self.quick.as_ref().map(|q| (q.l1_dim(), q.l2_dim()))
+    }
+
+    pub fn l2_ctrl(&self) -> L2ControlView {
+        L2ControlView {
+            inner: Arc::clone(&self.l2_ctrl),
+        }
+    }
+
+    pub async fn score_quick_dense_bytes_async(
+        &self,
+        parse_us: u64,
+        row_bytes_le: Bytes,
+    ) -> anyhow::Result<ScoreResponse> {
+        self.score_quick_dense_bytes_with_meta_async(parse_us, row_bytes_le, None)
+            .await
+    }
+
+    pub async fn score_quick_dense_bytes_with_meta_async(
+        &self,
+        parse_us: u64,
+        row_bytes_le: Bytes,
+        route_meta: Option<QuickRouteMeta>,
+    ) -> anyhow::Result<ScoreResponse> {
         let t0 = Instant::now();
-        let trace_id = req.trace_id.unwrap_or_else(Uuid::new_v4);
 
-        // deadline：预算式编程的核心
-        let budget = Duration::from_millis(self.cfg.slo_p99_ms);
-        let deadline = t0 + budget;
+        let mut timings = TimingsUs {
+            parse: parse_us,
+            ..TimingsUs::default()
+        };
 
-        let mut timings = TimingsUs::default();
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
 
-        // ---- feature stage
-        let tf0 = Instant::now();
-        let feats = self.extract_features(&req);
-        timings.feature = now_us(tf0);
-        metrics::histogram!("stage_feature_us").record(timings.feature as f64);
+        let out =
+            quick.predict_from_l1_bytes_with_meta(row_bytes_le.as_ref(), route_meta.as_ref())?;
+        timings.feature = out.feature_us;
+        timings.l1 = out.l1_us;
+        timings.l2 = out.l2_us;
+        timings.router = out.router_us;
 
-        // ---- router + L1
-        let tr0 = Instant::now();
-        let tl10 = Instant::now();
-        let s1 = self.models.l1.score(&feats);
-        timings.l1 = now_us(tl10);
-        metrics::histogram!("stage_l1_us").record(timings.l1 as f64);
+        crate::sampled_histogram!("stage_feature_us").record(timings.feature as f64);
+        crate::sampled_histogram!("stage_l1_us").record(timings.l1 as f64);
+        crate::sampled_histogram!("stage_router_us").record(timings.router as f64);
+        crate::sampled_histogram!("stage_l2_us").record(timings.l2 as f64);
 
-        // 不确定区间触发 L2
-        let mut score = s1;
-        let mut used_l2 = false;
+        if out.used_l2 {
+            crate::batched_counter!("router_l2_trigger_total").increment(1);
+        } else {
+            crate::batched_counter!("router_l2_trigger_total").increment(0);
+        }
 
-        if s1 > self.cfg.l1_uncertain_low && s1 < self.cfg.l1_uncertain_high {
-            // 预算检查：只在剩余预算足够时才触发
-            let now = Instant::now();
-            if now < deadline {
-                let remaining = deadline.duration_since(now);
-                // 经验阈值：留 1ms 给序列化等尾部
-                if remaining > Duration::from_millis(1) {
-                    let tl20 = Instant::now();
-                    let s2 = self.models.l2.score(&feats);
-                    timings.l2 = now_us(tl20);
-                    metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
-                    score = s2;
-                    used_l2 = true;
-                    metrics::counter!("router_l2_trigger_total").increment(1);
-                } else {
-                    metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                }
+        let mut resp = ScoreResponse {
+            trace_id: Uuid::new_v4(),
+            score: out.final_score as f64,
+            decision: out.decision,
+            reason: vec![
+                ReasonItem {
+                    signal: "l1_score".into(),
+                    value: out.l1_score as f64,
+                    baseline_p95: 0.0,
+                    direction: "info".into(),
+                },
+                ReasonItem {
+                    signal: "l2_score".into(),
+                    value: out.l2_score.unwrap_or(0.0) as f64,
+                    baseline_p95: 0.0,
+                    direction: "info".into(),
+                },
+            ],
+            timings_us: timings,
+        };
+
+        record_serialize_metrics(&mut resp);
+        record_e2e_metrics(t0);
+        Ok(resp)
+    }
+
+    pub fn predict_quick_l1_only_bytes(
+        &self,
+        row_bytes_le: &[u8],
+    ) -> anyhow::Result<QuickL1PredictOutput> {
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+        quick.predict_l1_only_from_bytes(row_bytes_le)
+    }
+
+    pub fn score_quick_dense_bytes_with_meta_batch_lite(
+        &self,
+        row_bytes_le: &[u8],
+        route_meta: Option<&QuickRouteMeta>,
+    ) -> anyhow::Result<BatchScoreLite> {
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+        let out = quick.predict_from_l1_bytes_with_meta(row_bytes_le, route_meta)?;
+        crate::batched_counter!("router_l2_trigger_total").increment(u64::from(out.used_l2));
+        Ok(BatchScoreLite {
+            decision: out.decision,
+            used_l2: out.used_l2,
+        })
+    }
+
+    pub fn predict_quick_l1_only_batch128_bytes(
+        &self,
+        rows: &[&[u8]; 128],
+    ) -> anyhow::Result<[QuickL1PredictOutput; 128]> {
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+        quick.predict_l1_only_batch128_from_bytes(rows)
+    }
+
+    pub fn score_quick_dense_batch128_http_ack_lite(
+        &self,
+        rows: &[&[u8]; 128],
+        metas: &[Option<QuickRouteMeta>; 128],
+    ) -> anyhow::Result<(u32, [u32; 5])> {
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+        let (used_l2_count, decision_counts) =
+            quick.predict_batch128_counts_from_l1_bytes_with_meta(rows, metas)?;
+        crate::batched_counter!("router_l2_trigger_total").increment(used_l2_count as u64);
+        Ok((used_l2_count, decision_counts))
+    }
+
+    pub fn score_standalone_batch128_http_ack_lite(
+        &self,
+        rows: &[&[u8]; 128],
+        metas: &[Option<QuickRouteMeta>; 128],
+        standalone_l2: &StandaloneL2Runtime,
+        tau_mode: StandaloneL2TauMode,
+    ) -> anyhow::Result<(u32, [u32; 5])> {
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+        let l1_outs = quick.predict_l1_only_batch128_from_bytes(rows)?;
+        let mut used_l2_count = 0u32;
+        let mut decision_counts = [0u32; 5];
+        let mut pending_sidecar_row_idx = [0usize; 128];
+        let mut pending_fold_id = [0i32; 128];
+        let mut pending_tau = [0f32; 128];
+        let mut pending_len = 0usize;
+
+        for i in 0..128 {
+            if l1_outs[i].passed {
+                decision_counts[0] += 1;
             } else {
-                metrics::counter!("router_timeout_before_l2_total").increment(1);
+                let route_meta = metas[i];
+                pending_sidecar_row_idx[pending_len] =
+                    route_meta.map(|m| m.row_idx as usize).unwrap_or(i);
+                pending_fold_id[pending_len] = route_meta.map(|m| m.fold_id).unwrap_or(0);
+                pending_tau[pending_len] = match tau_mode {
+                    StandaloneL2TauMode::Request => {
+                        route_meta.and_then(|m| m.l2_tau_used).context(
+                            "benchmark-only standalone L2 mode requires l2_tau_used in request",
+                        )?
+                    }
+                    StandaloneL2TauMode::Fixed(v) => v,
+                };
+                pending_len += 1;
             }
         }
 
-        timings.router = now_us(tr0);
-        metrics::histogram!("stage_router_us").record(timings.router as f64);
+        TLS_STANDALONE_L2_SCRATCH.with(|cell| -> anyhow::Result<()> {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(standalone_l2.new_scratch());
+            }
+            let scratch = slot.as_mut().expect("scratch initialized");
 
-        // ---- decision
-        let decision = if Instant::now() > deadline {
-            metrics::counter!("router_deadline_miss_total").increment(1);
-            Decision::DegradeAllow
-        } else if score >= self.cfg.deny_threshold {
-            Decision::Deny
-        } else if score >= self.cfg.review_threshold {
-            Decision::ManualReview
-        } else {
-            Decision::Allow
-        };
+            for slot in 0..pending_len {
+                crate::batched_counter!("router_l2_trigger_total").increment(1);
+                let l2_out = standalone_l2.predict_l2_row_by_index_with_scratch(
+                    pending_sidecar_row_idx[slot] % standalone_l2.feat_rows(),
+                    pending_tau[slot],
+                    pending_fold_id[slot],
+                    scratch,
+                )?;
+                used_l2_count += 1;
+                let idx = if l2_out.reject { 1 } else { 2 };
+                decision_counts[idx] += 1;
+            }
 
-        // ---- reason：给出“证据条目”（不是黑箱分数）
-        let mut reason = self.build_reason(&feats);
-        if used_l2 {
-            reason.push(ReasonItem {
-                signal: "layer2_used".into(),
-                value: 1.0,
-                baseline_p95: 1.0,
-                direction: "info".into(),
+            Ok(())
+        })?;
+
+        Ok((used_l2_count, decision_counts))
+    }
+
+    pub fn score_standalone_l2_from_l1_batch_lite(
+        &self,
+        l1_out: QuickL1PredictOutput,
+        route_meta: Option<&QuickRouteMeta>,
+        standalone_l2: &StandaloneL2Runtime,
+        sidecar_row_idx: usize,
+        tau_mode: StandaloneL2TauMode,
+    ) -> anyhow::Result<BatchScoreLite> {
+        if l1_out.passed {
+            crate::batched_counter!("router_l2_trigger_total").increment(0);
+            return Ok(BatchScoreLite {
+                decision: crate::schema::Decision::Allow,
+                used_l2: false,
             });
         }
 
-        // ---- serialize stage（这里只是统计，真正的序列化在 server 层）
-        let ts0 = Instant::now();
-        timings.serialize = now_us(ts0);
-        metrics::histogram!("stage_serialize_us").record(timings.serialize as f64);
-
-        // end-to-end
-        metrics::histogram!("e2e_us").record(now_us(t0) as f64);
-
-        ScoreResponse {
-            trace_id,
-            score,
+        crate::batched_counter!("router_l2_trigger_total").increment(1);
+        let tau = match tau_mode {
+            StandaloneL2TauMode::Request => route_meta
+                .and_then(|m| m.l2_tau_used)
+                .context("benchmark-only standalone L2 mode requires l2_tau_used in request")?,
+            StandaloneL2TauMode::Fixed(v) => v,
+        };
+        let fold_id = route_meta.map(|m| m.fold_id).unwrap_or(0);
+        let l2_out = TLS_STANDALONE_L2_SCRATCH.with(|cell| -> anyhow::Result<_> {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(standalone_l2.new_scratch());
+            }
+            let scratch = slot.as_mut().expect("scratch initialized");
+            standalone_l2.predict_l2_row_by_index_with_scratch(
+                sidecar_row_idx % standalone_l2.feat_rows(),
+                tau,
+                fold_id,
+                scratch,
+            )
+        })?;
+        let decision = if l2_out.reject {
+            crate::schema::Decision::Deny
+        } else {
+            crate::schema::Decision::ManualReview
+        };
+        Ok(BatchScoreLite {
             decision,
-            reason,
+            used_l2: true,
+        })
+    }
+
+    pub async fn score_quick_dense_bytes_with_standalone_bench_l2_async(
+        &self,
+        parse_us: u64,
+        row_bytes_le: Bytes,
+        route_meta: Option<QuickRouteMeta>,
+        standalone_l2: &StandaloneL2Runtime,
+        sidecar_row_idx: usize,
+        tau_mode: StandaloneL2TauMode,
+    ) -> anyhow::Result<ScoreResponse> {
+        let t0 = Instant::now();
+
+        let mut timings = TimingsUs {
+            parse: parse_us,
+            ..TimingsUs::default()
+        };
+
+        let quick = self
+            .quick
+            .as_ref()
+            .context("quickscorer not enabled: use new_with_quickscorer_bundle")?;
+
+        let l1_out = quick.predict_l1_only_from_bytes(row_bytes_le.as_ref())?;
+        timings.l1 = l1_out.l1_us;
+        timings.router = l1_out.router_us;
+        crate::sampled_histogram!("stage_l1_us").record(timings.l1 as f64);
+        crate::sampled_histogram!("stage_router_us").record(timings.router as f64);
+
+        let (decision, final_score, l2_score) = if l1_out.passed {
+            crate::batched_counter!("router_l2_trigger_total").increment(0);
+            (crate::schema::Decision::Allow, l1_out.l1_score, None)
+        } else {
+            crate::batched_counter!("router_l2_trigger_total").increment(1);
+            let tau = match tau_mode {
+                StandaloneL2TauMode::Request => route_meta
+                    .as_ref()
+                    .and_then(|m| m.l2_tau_used)
+                    .context("benchmark-only standalone L2 mode requires l2_tau_used in request")?,
+                StandaloneL2TauMode::Fixed(v) => v,
+            };
+            let fold_id = route_meta.as_ref().map(|m| m.fold_id).unwrap_or(0);
+            let t_l2 = Instant::now();
+            let l2_out = TLS_STANDALONE_L2_SCRATCH.with(|cell| -> anyhow::Result<_> {
+                let mut slot = cell.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(standalone_l2.new_scratch());
+                }
+                let scratch = slot.as_mut().expect("scratch initialized");
+                standalone_l2.predict_l2_row_by_index_with_scratch(
+                    sidecar_row_idx % standalone_l2.feat_rows(),
+                    tau,
+                    fold_id,
+                    scratch,
+                )
+            })?;
+            timings.l2 = now_us(t_l2);
+            crate::sampled_histogram!("stage_l2_us").record(timings.l2 as f64);
+            let decision = if l2_out.reject {
+                crate::schema::Decision::Deny
+            } else {
+                crate::schema::Decision::ManualReview
+            };
+            (decision, l2_out.score, Some(l2_out.score))
+        };
+
+        let mut resp = ScoreResponse {
+            trace_id: Uuid::new_v4(),
+            score: final_score as f64,
+            decision,
+            reason: vec![
+                ReasonItem {
+                    signal: "l1_score".into(),
+                    value: l1_out.l1_score as f64,
+                    baseline_p95: 0.0,
+                    direction: "info".into(),
+                },
+                ReasonItem {
+                    signal: "l2_score".into(),
+                    value: l2_score.unwrap_or(0.0) as f64,
+                    baseline_p95: 0.0,
+                    direction: "info".into(),
+                },
+            ],
             timings_us: timings,
-        }
-    }
-
-    fn extract_features(&self, req: &ScoreRequest) -> Vec<(String, f64)> {
-        // store features (query_then_update, 先读后写)
-        let sf = self
-            .store
-            .query_then_update(&req.user_id, req.event_time_ms, req.amount);
-
-        let amount_log = (req.amount.max(0.01)).ln();
-        let is_foreign = if req.country.as_str() != "JP" {
-            1.0
-        } else {
-            0.0
         };
 
-        let mcc_risk = match req.mcc {
-            7995 => 1.0, // gambling
-            6011 => 0.8, // atm
-            4829 => 0.6, // wire transfer
-            _ => 0.2,
-        };
-
-        let device_risky = if req.device_id.ends_with("0") {
-            1.0
-        } else {
-            0.0
-        };
-        let ip_risky = if req.ip_prefix.starts_with("198.") {
-            1.0
-        } else {
-            0.0
-        };
-        let is_3ds = if req.is_3ds { 1.0 } else { 0.0 };
-
-        vec![
-            ("amount_log".into(), amount_log),
-            ("is_foreign".into(), is_foreign),
-            ("mcc_risk".into(), mcc_risk),
-            ("device_risky".into(), device_risky),
-            ("ip_risky".into(), ip_risky),
-            ("is_3ds".into(), is_3ds),
-            ("velocity_60s".into(), sf.velocity_60s),
-            ("velocity_300s".into(), sf.velocity_300s),
-            ("amount_sum_60s".into(), sf.amount_sum_60s),
-            ("amount_sum_300s".into(), sf.amount_sum_300s),
-            ("inter_arrival_ms".into(), sf.inter_arrival_ms),
-            ("oo_order_flag".into(), sf.oo_order_flag),
-        ]
-    }
-
-    fn build_reason(&self, feats: &[(String, f64)]) -> Vec<ReasonItem> {
-        // 简化：挑几个典型信号返回
-        let mut out = Vec::with_capacity(4);
-
-        let get = |k: &str| {
-            feats
-                .iter()
-                .find(|(n, _)| n == k)
-                .map(|(_, v)| *v)
-                .unwrap_or(0.0)
-        };
-
-        let amount_log = get("amount_log");
-        out.push(ReasonItem {
-            signal: "amount_log".into(),
-            value: amount_log,
-            baseline_p95: 6.5,
-            direction: if amount_log > 6.5 {
-                "risk_up"
-            } else {
-                "risk_down"
-            }
-            .into(),
-        });
-
-        let v60 = get("velocity_60s");
-        out.push(ReasonItem {
-            signal: "velocity_60s".into(),
-            value: v60,
-            baseline_p95: 4.0,
-            direction: if v60 > 4.0 { "risk_up" } else { "risk_down" }.into(),
-        });
-
-        let foreign = get("is_foreign");
-        out.push(ReasonItem {
-            signal: "is_foreign".into(),
-            value: foreign,
-            baseline_p95: 1.0,
-            direction: if foreign > 0.5 {
-                "risk_up"
-            } else {
-                "risk_down"
-            }
-            .into(),
-        });
-
-        let mcc = get("mcc_risk");
-        out.push(ReasonItem {
-            signal: "mcc_risk".into(),
-            value: mcc,
-            baseline_p95: 0.8,
-            direction: if mcc > 0.8 { "risk_up" } else { "risk_down" }.into(),
-        });
-
-        out
+        record_serialize_metrics(&mut resp);
+        record_e2e_metrics(t0);
+        Ok(resp)
     }
 }

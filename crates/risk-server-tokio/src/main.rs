@@ -1,6 +1,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
-    convert::Infallible, net::SocketAddr, path::Path, str::FromStr, sync::Arc, time::Instant,
+    convert::Infallible,
+    io,
+    io::{Read, Write},
+    net::SocketAddr,
+    path::Path,
+    str::FromStr,
+    sync::{mpsc as std_mpsc, Arc},
+    time::Instant,
 };
 
 use anyhow::Context;
@@ -15,11 +22,12 @@ use axum::{
     Json, Router,
 };
 use bytes::BytesMut;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use http_body_util::BodyExt;
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use mio::{Events, Interest, Poll, Token, Waker};
 use risk_core::{
     config::Config,
     pipeline::AppCore,
@@ -39,7 +47,11 @@ const HDR_RISK_TIMINGS_US: HeaderName = HeaderName::from_static("x-risk-timings-
 const H1_BATCH_ACK_PREFIX: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nContent-Type: application/octet-stream\r\n\r\n";
 const H1_TEXT_PREFIX_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+const H1_BATCH_PEEK_BYTES: usize = 1024;
 const MAX_H1_BATCH_HEADER_BYTES: usize = 4096;
+const H1_BATCH_ACK_BODY_LEN: usize = 40;
+const H1_BATCH_BINARY_REPLY_LEN: usize = H1_BATCH_ACK_PREFIX.len() + H1_BATCH_ACK_BODY_LEN;
+const H1_BATCH_WAKE_TOKEN: Token = Token(0);
 
 #[derive(Clone, Debug)]
 struct DenseRequest {
@@ -85,6 +97,16 @@ struct Args {
     /// Sample 1/N throughput h2 bench requests for server-side stage timing metrics
     #[arg(long, default_value_t = 1024)]
     bench3_h2_sample_rate: usize,
+
+    /// Batch dataplane implementation for fixed batch128 HTTP/1.1 requests
+    #[arg(long, value_enum, default_value_t = H1BatchDataplaneMode::MioShard)]
+    h1_batch_dataplane: H1BatchDataplaneMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum H1BatchDataplaneMode {
+    TokioShard,
+    MioShard,
 }
 
 #[derive(Clone)]
@@ -125,6 +147,41 @@ struct H1BatchParsedRequest {
 enum H1BatchReply {
     Binary(Bytes),
     Text(StatusCode, String),
+}
+
+struct MioShardHandle {
+    tx: std_mpsc::Sender<std::net::TcpStream>,
+    waker: Arc<Waker>,
+}
+
+struct MioBatchConn {
+    stream: mio::net::TcpStream,
+    read_buf: BytesMut,
+    write_buf: Vec<u8>,
+    write_off: usize,
+    close_after_write: bool,
+}
+
+impl MioBatchConn {
+    fn new(stream: mio::net::TcpStream, max_request_len: usize) -> Self {
+        Self {
+            stream,
+            read_buf: BytesMut::with_capacity(max_request_len),
+            write_buf: Vec::with_capacity(H1_BATCH_BINARY_REPLY_LEN.max(256)),
+            write_off: 0,
+            close_after_write: false,
+        }
+    }
+
+    fn has_pending_write(&self) -> bool {
+        self.write_off < self.write_buf.len()
+    }
+
+    fn clear_write_buf(&mut self) {
+        self.write_buf.clear();
+        self.write_off = 0;
+        self.close_after_write = false;
+    }
 }
 
 fn env_usize(name: &str, default_value: usize) -> usize {
@@ -186,8 +243,8 @@ async fn debug_backend(State(st): State<AppState>) -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }
 
-/// tower 的 load_shed / concurrency_limit 早拒绝会走到这里。
-/// 我们统一变成 429 overloaded（不再出现你日志里的 503 latency=0ms）。
+/// Early rejections from tower load_shed / concurrency_limit end up here.
+/// Normalize them to HTTP 429.
 
 fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<DenseRequest, String> {
     let b = body.as_ref();
@@ -452,6 +509,27 @@ fn encode_batch_aggregate_ack(
         out[off..off + 4].copy_from_slice(&count.to_le_bytes());
     }
     out
+}
+
+fn build_h1_text_reply(status: StatusCode, msg: &str) -> Vec<u8> {
+    let reason = status.canonical_reason().unwrap_or("Error");
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\n\r\n",
+        status.as_u16(),
+        reason,
+        msg.len(),
+        H1_TEXT_PREFIX_CONTENT_TYPE
+    );
+    let mut out = Vec::with_capacity(head.len() + msg.len());
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(msg.as_bytes());
+    out
+}
+
+fn fill_h1_binary_reply(write_buf: &mut Vec<u8>, ack: [u8; 40]) {
+    write_buf.clear();
+    write_buf.extend_from_slice(H1_BATCH_ACK_PREFIX);
+    write_buf.extend_from_slice(&ack);
 }
 
 fn parse_batch_dense_payload_le(
@@ -863,13 +941,13 @@ fn score_dense_batch_parse_only_request_http_ack_v1(
     )))
 }
 
-fn score_dense_batch_binary_request_http_ack_v1_batch128(
+fn score_dense_batch_binary_request_http_ack_v1_batch128_fixed(
     st: &AppState,
-    body: Bytes,
+    body: &[u8],
     has_route_meta: bool,
     record_bytes: usize,
-) -> Result<Bytes, (StatusCode, String)> {
-    let refs = parse_batch128_refs(&body, has_route_meta, record_bytes)
+) -> Result<[u8; 40], (StatusCode, String)> {
+    let refs = parse_batch128_refs(body, has_route_meta, record_bytes)
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
 
     st.core.quick.as_ref().ok_or_else(|| {
@@ -901,12 +979,27 @@ fn score_dense_batch_binary_request_http_ack_v1_batch128(
             })?
     };
 
-    Ok(Bytes::copy_from_slice(&encode_batch_aggregate_ack(
+    Ok(encode_batch_aggregate_ack(
         128,
         128,
         used_l2_count,
         decision_counts,
-    )))
+    ))
+}
+
+fn score_dense_batch_binary_request_http_ack_v1_batch128(
+    st: &AppState,
+    body: Bytes,
+    has_route_meta: bool,
+    record_bytes: usize,
+) -> Result<Bytes, (StatusCode, String)> {
+    score_dense_batch_binary_request_http_ack_v1_batch128_fixed(
+        st,
+        body.as_ref(),
+        has_route_meta,
+        record_bytes,
+    )
+    .map(|ack| Bytes::copy_from_slice(&ack))
 }
 
 fn batch_binary_response(bin: Bytes) -> Response {
@@ -944,15 +1037,54 @@ fn parse_peek_h1_batch_fast_path(buf: &[u8]) -> Option<H1BatchFastPath> {
     h1_batch_fast_path(path)
 }
 
+fn parse_peek_h1_batch_dataplane_target(
+    buf: &[u8],
+    expected_dim: usize,
+) -> Option<H1BatchFastPath> {
+    let header_end = find_header_end(buf)?;
+    let header = std::str::from_utf8(&buf[..header_end]).ok()?;
+    let mut lines = header.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_whitespace();
+    if parts.next()? != "POST" {
+        return None;
+    }
+    let fast_path = h1_batch_fast_path(parts.next()?)?;
+    let content_len = lines.find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("content-length") {
+            return None;
+        }
+        value.trim().parse::<usize>().ok()
+    })?;
+    batch128_shape_for_content_len(expected_dim, content_len)?;
+    Some(fast_path)
+}
+
 async fn maybe_peek_h1_batch_fast_path(
     stream: &tokio::net::TcpStream,
 ) -> std::io::Result<Option<H1BatchFastPath>> {
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; H1_BATCH_PEEK_BYTES];
     let n = stream.peek(&mut buf).await?;
     if n == 0 {
         return Ok(None);
     }
     Ok(parse_peek_h1_batch_fast_path(&buf[..n]))
+}
+
+async fn maybe_peek_h1_batch_dataplane_target(
+    stream: &tokio::net::TcpStream,
+    expected_dim: usize,
+) -> std::io::Result<Option<H1BatchFastPath>> {
+    let mut buf = [0u8; H1_BATCH_PEEK_BYTES];
+    let n = stream.peek(&mut buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(parse_peek_h1_batch_dataplane_target(
+        &buf[..n],
+        expected_dim,
+    ))
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -1166,7 +1298,7 @@ async fn serve_h1_batch_dataplane_conn(
     }
 }
 
-fn spawn_h1_batch_dataplane_shards(
+fn spawn_h1_batch_dataplane_tokio_shards(
     shard_count: usize,
     st: AppState,
 ) -> Vec<mpsc::UnboundedSender<std::net::TcpStream>> {
@@ -1221,6 +1353,307 @@ fn spawn_h1_batch_dataplane_shards(
     senders
 }
 
+fn queue_mio_text_reply(conn: &mut MioBatchConn, status: StatusCode, msg: impl Into<String>) {
+    let msg = msg.into();
+    conn.clear_write_buf();
+    conn.write_buf = build_h1_text_reply(status, &msg);
+    conn.close_after_write = true;
+}
+
+fn queue_mio_binary_reply(conn: &mut MioBatchConn, ack: [u8; 40]) {
+    conn.clear_write_buf();
+    fill_h1_binary_reply(&mut conn.write_buf, ack);
+}
+
+fn mio_conn_interest(conn: &MioBatchConn) -> Interest {
+    if conn.has_pending_write() {
+        Interest::READABLE.add(Interest::WRITABLE)
+    } else {
+        Interest::READABLE
+    }
+}
+
+fn read_mio_batch_conn(conn: &mut MioBatchConn, max_request_len: usize) -> io::Result<bool> {
+    let mut scratch = [0u8; 8192];
+    loop {
+        match conn.stream.read(&mut scratch) {
+            Ok(0) => return Ok(true),
+            Ok(n) => {
+                if conn.read_buf.len().saturating_add(n) > max_request_len {
+                    queue_mio_text_reply(
+                        conn,
+                        StatusCode::BAD_REQUEST,
+                        "request too large for batch data plane",
+                    );
+                    return Ok(false);
+                }
+                conn.read_buf.extend_from_slice(&scratch[..n]);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(true)
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn write_mio_batch_conn(conn: &mut MioBatchConn) -> io::Result<bool> {
+    while conn.has_pending_write() {
+        match conn.stream.write(&conn.write_buf[conn.write_off..]) {
+            Ok(0) => return Ok(true),
+            Ok(n) => conn.write_off += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(true)
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if conn.write_off == conn.write_buf.len() {
+        let should_close = conn.close_after_write;
+        conn.clear_write_buf();
+        if should_close {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn process_one_mio_batch_request(
+    conn: &mut MioBatchConn,
+    st: &AppState,
+    expected_dim: usize,
+) -> io::Result<bool> {
+    let req = match parse_h1_batch_request_from_buf(&mut conn.read_buf) {
+        Ok(Some(req)) => req,
+        Ok(None) => return Ok(false),
+        Err(msg) => {
+            queue_mio_text_reply(conn, StatusCode::BAD_REQUEST, msg);
+            return Ok(true);
+        }
+    };
+
+    if req.method != Method::POST {
+        queue_mio_text_reply(conn, StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        return Ok(true);
+    }
+    let Some(fast_path) = req.fast_path else {
+        queue_mio_text_reply(conn, StatusCode::NOT_FOUND, "not found");
+        return Ok(true);
+    };
+    let Some(shape) = batch128_shape_for_content_len(expected_dim, req.content_len) else {
+        queue_mio_text_reply(
+            conn,
+            StatusCode::BAD_REQUEST,
+            "batch dataplane only supports fixed batch128 requests",
+        );
+        return Ok(true);
+    };
+
+    let _permit = match st.bench_in_flight.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            queue_mio_text_reply(conn, StatusCode::TOO_MANY_REQUESTS, "overloaded");
+            return Ok(true);
+        }
+    };
+
+    match execute_h1_batch_fixed_request(st, fast_path, shape, req.body.as_ref()) {
+        Ok(ack) => queue_mio_binary_reply(conn, ack),
+        Err((status, msg)) => queue_mio_text_reply(conn, status, msg),
+    }
+    Ok(true)
+}
+
+fn spawn_h1_batch_dataplane_mio_shards(
+    shard_count: usize,
+    st: AppState,
+) -> anyhow::Result<Vec<MioShardHandle>> {
+    let Some((expected_dim, _)) = st.core.quick_dims() else {
+        anyhow::bail!("quickscorer not enabled: start server with --bundle-dir");
+    };
+
+    let max_route_record_bytes = expected_dim
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(40))
+        .ok_or_else(|| anyhow::anyhow!("batch route record bytes overflow"))?;
+    let max_body_len = 16usize
+        .checked_add(
+            128usize
+                .checked_mul(max_route_record_bytes)
+                .ok_or_else(|| anyhow::anyhow!("batch max body length overflow"))?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("batch max body length overflow"))?;
+    let max_request_len = MAX_H1_BATCH_HEADER_BYTES
+        .checked_add(max_body_len)
+        .ok_or_else(|| anyhow::anyhow!("batch max request length overflow"))?;
+
+    let mut handles = Vec::with_capacity(shard_count.max(1));
+    for shard_idx in 0..shard_count.max(1) {
+        let (tx, rx) = std_mpsc::channel::<std::net::TcpStream>();
+        let st2 = st.clone();
+        let (waker_tx, waker_rx) = std_mpsc::channel::<Arc<Waker>>();
+        std::thread::Builder::new()
+            .name(format!("h1-batch-dp-mio-{shard_idx}"))
+            .spawn(move || {
+                let mut poll = Poll::new().expect("create mio poll");
+                let waker = Arc::new(
+                    Waker::new(poll.registry(), H1_BATCH_WAKE_TOKEN)
+                        .expect("create mio batch shard waker"),
+                );
+                waker_tx
+                    .send(waker.clone())
+                    .expect("send mio batch shard waker");
+
+                let mut events = Events::with_capacity(1024);
+                let mut conns: Vec<Option<MioBatchConn>> = Vec::new();
+                let mut free_slots = Vec::new();
+
+                loop {
+                    if let Err(e) = poll.poll(&mut events, None) {
+                        warn!(error = %e, shard = shard_idx, "mio batch dataplane poll failed");
+                        continue;
+                    }
+
+                    for event in events.iter() {
+                        if event.token() == H1_BATCH_WAKE_TOKEN {
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(std_stream) => {
+                                        if let Err(e) = std_stream.set_nonblocking(true) {
+                                            warn!(error = %e, shard = shard_idx, "set batch dataplane stream nonblocking failed");
+                                            continue;
+                                        }
+                                        let mut stream = mio::net::TcpStream::from_std(std_stream);
+                                        let slot = free_slots.pop().unwrap_or_else(|| {
+                                            conns.push(None);
+                                            conns.len() - 1
+                                        });
+                                        let token = Token(slot + 1);
+                                        if let Err(e) = poll
+                                            .registry()
+                                            .register(&mut stream, token, Interest::READABLE)
+                                        {
+                                            warn!(error = %e, shard = shard_idx, "register batch dataplane stream failed");
+                                            if slot + 1 == conns.len() {
+                                                conns.pop();
+                                            } else {
+                                                free_slots.push(slot);
+                                            }
+                                            continue;
+                                        }
+                                        conns[slot] = Some(MioBatchConn::new(stream, max_request_len));
+                                    }
+                                    Err(std_mpsc::TryRecvError::Empty) => break,
+                                    Err(std_mpsc::TryRecvError::Disconnected) => return,
+                                }
+                            }
+                            continue;
+                        }
+
+                        let slot = event.token().0.saturating_sub(1);
+                        let Some(conn) = conns.get_mut(slot).and_then(Option::as_mut) else {
+                            continue;
+                        };
+
+                        let mut should_close =
+                            event.is_error() || event.is_read_closed() || event.is_write_closed();
+
+                        if !should_close && conn.has_pending_write() && event.is_writable() {
+                            match write_mio_batch_conn(conn) {
+                                Ok(close) => should_close = close,
+                                Err(e) => {
+                                    warn!(error = %e, shard = shard_idx, "write batch dataplane conn failed");
+                                    should_close = true;
+                                }
+                            }
+                        }
+
+                        if !should_close && !conn.has_pending_write() && event.is_readable() {
+                            match read_mio_batch_conn(conn, max_request_len) {
+                                Ok(close) => should_close = close,
+                                Err(e) => {
+                                    warn!(error = %e, shard = shard_idx, "read batch dataplane conn failed");
+                                    should_close = true;
+                                }
+                            }
+                        }
+
+                        if !should_close && !conn.has_pending_write() {
+                            loop {
+                                let queued = match process_one_mio_batch_request(conn, &st2, expected_dim) {
+                                    Ok(queued) => queued,
+                                    Err(e) => {
+                                        warn!(error = %e, shard = shard_idx, "process batch dataplane request failed");
+                                        should_close = true;
+                                        break;
+                                    }
+                                };
+                                if !queued {
+                                    break;
+                                }
+                                match write_mio_batch_conn(conn) {
+                                    Ok(close) => {
+                                        should_close = close;
+                                        if should_close || conn.has_pending_write() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, shard = shard_idx, "flush batch dataplane reply failed");
+                                        should_close = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if should_close {
+                            if let Some(mut conn) = conns[slot].take() {
+                                let _ = poll.registry().deregister(&mut conn.stream);
+                                free_slots.push(slot);
+                            }
+                            continue;
+                        }
+
+                        let interest = mio_conn_interest(conn);
+                        if let Err(e) = poll
+                            .registry()
+                            .reregister(&mut conn.stream, Token(slot + 1), interest)
+                        {
+                            warn!(error = %e, shard = shard_idx, "reregister batch dataplane conn failed");
+                            if let Some(mut conn) = conns[slot].take() {
+                                let _ = poll.registry().deregister(&mut conn.stream);
+                                free_slots.push(slot);
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn mio h1 batch dataplane shard");
+
+        let waker = waker_rx.recv().expect("receive mio batch shard waker");
+        handles.push(MioShardHandle { tx, waker });
+    }
+    Ok(handles)
+}
+
 async fn read_fixed_body(mut body: Incoming, content_len: usize) -> Result<Bytes, String> {
     let mut buf = BytesMut::with_capacity(content_len);
     while let Some(frame) = body.frame().await {
@@ -1247,37 +1680,55 @@ async fn read_fixed_body(mut body: Incoming, content_len: usize) -> Result<Bytes
     Ok(buf.freeze())
 }
 
-fn score_dense_batch_null_request_http_ack_v1_batch128(
+fn score_dense_batch_null_request_http_ack_v1_batch128_fixed(
     body: &[u8],
     has_route_meta: bool,
     record_bytes: usize,
-) -> Result<Bytes, (StatusCode, String)> {
+) -> Result<[u8; 40], (StatusCode, String)> {
     validate_batch128_header(body, has_route_meta, record_bytes)
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-    Ok(Bytes::copy_from_slice(&encode_batch_aggregate_ack(
-        128,
-        128,
-        0,
-        [128, 0, 0, 0, 0],
-    )))
+    Ok(encode_batch_aggregate_ack(128, 128, 0, [128, 0, 0, 0, 0]))
 }
 
-fn score_dense_batch_parse_only_request_http_ack_v1_batch128(
+fn score_dense_batch_parse_only_request_http_ack_v1_batch128_fixed(
     body: Bytes,
     has_route_meta: bool,
     record_bytes: usize,
-) -> Result<Bytes, (StatusCode, String)> {
+) -> Result<[u8; 40], (StatusCode, String)> {
     validate_batch128_header(body.as_ref(), has_route_meta, record_bytes)
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let refs = parse_batch128_refs(body.as_ref(), has_route_meta, record_bytes)
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let _ = refs;
-    Ok(Bytes::copy_from_slice(&encode_batch_aggregate_ack(
-        128,
-        128,
-        0,
-        [128, 0, 0, 0, 0],
-    )))
+    Ok(encode_batch_aggregate_ack(128, 128, 0, [128, 0, 0, 0, 0]))
+}
+
+fn execute_h1_batch_fixed_request(
+    st: &AppState,
+    fast_path: H1BatchFastPath,
+    shape: Batch128Shape,
+    body: &[u8],
+) -> Result<[u8; 40], (StatusCode, String)> {
+    match fast_path {
+        H1BatchFastPath::Score => score_dense_batch_binary_request_http_ack_v1_batch128_fixed(
+            st,
+            body,
+            shape.has_route_meta,
+            shape.record_bytes,
+        ),
+        H1BatchFastPath::Null => score_dense_batch_null_request_http_ack_v1_batch128_fixed(
+            body,
+            shape.has_route_meta,
+            shape.record_bytes,
+        ),
+        H1BatchFastPath::ParseOnly => {
+            score_dense_batch_parse_only_request_http_ack_v1_batch128_fixed(
+                Bytes::copy_from_slice(body),
+                shape.has_route_meta,
+                shape.record_bytes,
+            )
+        }
+    }
 }
 
 async fn execute_h1_batch_fast_request(
@@ -1296,26 +1747,8 @@ async fn execute_h1_batch_fast_request(
     let outcome = if let Some(shape) =
         content_len.and_then(|len| batch128_shape_for_content_len(expected_dim, len))
     {
-        match fast_path {
-            H1BatchFastPath::Score => score_dense_batch_binary_request_http_ack_v1_batch128(
-                st,
-                body,
-                shape.has_route_meta,
-                shape.record_bytes,
-            ),
-            H1BatchFastPath::Null => score_dense_batch_null_request_http_ack_v1_batch128(
-                body.as_ref(),
-                shape.has_route_meta,
-                shape.record_bytes,
-            ),
-            H1BatchFastPath::ParseOnly => {
-                score_dense_batch_parse_only_request_http_ack_v1_batch128(
-                    body,
-                    shape.has_route_meta,
-                    shape.record_bytes,
-                )
-            }
-        }
+        execute_h1_batch_fixed_request(st, fast_path, shape, body.as_ref())
+            .map(|ack| Bytes::copy_from_slice(&ack))
     } else {
         match fast_path {
             H1BatchFastPath::Score => score_dense_batch_binary_request_http_ack_v1(st, body).await,
@@ -1634,17 +2067,14 @@ async fn run_h2_bench_listener(addr: SocketAddr, st: AppState) -> anyhow::Result
     }
 }
 
-/// ✅ Dense f32 直传 + Binary response（application/octet-stream）
-/// 请求体为 raw f32le 或带 RVEC header 的 dense payload。
+/// Dense f32 request path with a binary response.
+/// The request body is raw f32le or an RVEC-framed dense payload.
 async fn score_dense_f32_bin(State(st): State<AppState>, body: Bytes) -> Response {
     match score_dense_binary_request(&st, body).await {
         Ok((trace_id, resp)) => {
-            // 让 timings.serialize 代表二进制序列化时间（而不是 core 侧的 JSON to_vec 计时）。
+            // Keep timings.serialize aligned with binary encoding time.
             let t_ser = Instant::now();
-            // 先用旧值编码，拿到真实编码开销后再写回再编码一遍会多一次分配。
-            // 我们这里走“单次编码”：先估计 serialize_us=0，编码后写回到 header 里的 timings.serialize。
-            // 为了保持简单，直接把 serialize_us 记到 metrics 上，不再写回 body。
-            // （bench 端依然能从 stage_p99 里看到 serialize 的数量级，且目前 serialize 占比极小）
+            // Use a single encode pass and record serialize_us via metrics.
             let bin = encode_rsk1_response(trace_id, &resp);
             let _serialize_us = t_ser.elapsed().as_micros() as u64;
             let mut r = Response::new(axum::body::Body::from(bin));
@@ -1653,7 +2083,7 @@ async fn score_dense_f32_bin(State(st): State<AppState>, body: Bytes) -> Respons
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
             );
-            // trace_id 只在错误时打日志，避免热路径噪声；客户端会拿到 trace_id。
+            // Keep trace_id in the response and avoid logging it on the hot path.
             r
         }
         Err((status, msg)) => {
@@ -1838,7 +2268,7 @@ async fn async_main(
         .with_state(st.clone())
         .layer(
             ServiceBuilder::new()
-                // ✅ 关键：HandleErrorLayer 必须包在最外层，才能把 overload 变成 429
+                // HandleErrorLayer must stay outermost so overload becomes HTTP 429.
                 .layer(HandleErrorLayer::new(handle_tower_overload))
                 .layer(tower::load_shed::LoadShedLayer::new())
                 .layer(tower::limit::ConcurrencyLimitLayer::new(args.max_in_flight))
@@ -1852,7 +2282,23 @@ async fn async_main(
     let addr = SocketAddr::from_str(&args.listen).context("invalid --listen")?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("listening on http://{}", addr);
-    let h1_batch_shards = spawn_h1_batch_dataplane_shards(worker_threads.max(1), st.clone());
+    let batch_expected_dim = st.core.quick_dims().map(|(dim, _)| dim);
+    let h1_batch_tokio_shards = if args.h1_batch_dataplane == H1BatchDataplaneMode::TokioShard {
+        Some(spawn_h1_batch_dataplane_tokio_shards(
+            worker_threads.max(1),
+            st.clone(),
+        ))
+    } else {
+        None
+    };
+    let h1_batch_mio_shards = if args.h1_batch_dataplane == H1BatchDataplaneMode::MioShard {
+        Some(spawn_h1_batch_dataplane_mio_shards(
+            worker_threads.max(1),
+            st.clone(),
+        )?)
+    } else {
+        None
+    };
     let mut next_h1_batch_shard = 0usize;
 
     if let Some(h2_addr) = args.bench3_h2_listen.as_ref() {
@@ -1868,21 +2314,47 @@ async fn async_main(
     loop {
         let (stream, peer) = listener.accept().await.context("accept h1 connection")?;
         stream.set_nodelay(true).ok();
-        if let Some(_) = maybe_peek_h1_batch_fast_path(&stream)
-            .await
-            .context("peek h1 batch path")?
-        {
-            let shard_idx = next_h1_batch_shard % h1_batch_shards.len().max(1);
-            next_h1_batch_shard = next_h1_batch_shard.wrapping_add(1);
-            let std_stream = stream
-                .into_std()
-                .context("convert h1 batch stream to std")?;
-            if h1_batch_shards[shard_idx].send(std_stream).is_err() {
-                return Err(anyhow::anyhow!(
-                    "h1 batch dataplane shard {shard_idx} is closed"
-                ));
+        if let Some(h1_batch_shards) = h1_batch_tokio_shards.as_ref() {
+            if let Some(_) = maybe_peek_h1_batch_fast_path(&stream)
+                .await
+                .context("peek h1 batch path")?
+            {
+                let shard_idx = next_h1_batch_shard % h1_batch_shards.len().max(1);
+                next_h1_batch_shard = next_h1_batch_shard.wrapping_add(1);
+                let std_stream = stream
+                    .into_std()
+                    .context("convert h1 batch stream to std")?;
+                if h1_batch_shards[shard_idx].send(std_stream).is_err() {
+                    return Err(anyhow::anyhow!(
+                        "h1 batch dataplane shard {shard_idx} is closed"
+                    ));
+                }
+                continue;
             }
-            continue;
+        } else if let (Some(h1_batch_shards), Some(expected_dim)) =
+            (h1_batch_mio_shards.as_ref(), batch_expected_dim)
+        {
+            if let Some(_) = maybe_peek_h1_batch_dataplane_target(&stream, expected_dim)
+                .await
+                .context("peek h1 batch dataplane target")?
+            {
+                let shard_idx = next_h1_batch_shard % h1_batch_shards.len().max(1);
+                next_h1_batch_shard = next_h1_batch_shard.wrapping_add(1);
+                let std_stream = stream
+                    .into_std()
+                    .context("convert h1 batch stream to std")?;
+                h1_batch_shards[shard_idx]
+                    .tx
+                    .send(std_stream)
+                    .map_err(|_| {
+                        anyhow::anyhow!("h1 batch dataplane shard {shard_idx} is closed")
+                    })?;
+                h1_batch_shards[shard_idx]
+                    .waker
+                    .wake()
+                    .context("wake h1 batch dataplane shard")?;
+                continue;
+            }
         }
         let st2 = st.clone();
         let app2 = app.clone();
@@ -1895,7 +2367,7 @@ async fn async_main(
 }
 
 fn main() -> anyhow::Result<()> {
-    // 继续支持你现在的环境变量启动方式
+    // Keep the existing environment-variable startup path.
     let worker_threads = env_usize("TOKIO_WORKER_THREADS", 4);
     let max_blocking_threads = env_usize("TOKIO_MAX_BLOCKING_THREADS", 4);
 

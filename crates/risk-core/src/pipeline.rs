@@ -80,7 +80,7 @@ fn tls_rand_u64() -> u64 {
                 .unwrap_or_default()
                 .as_nanos() as u64;
             let salt = (std::process::id() as u64).wrapping_mul(0x9e3779b97f4a7c15);
-            let addr = (&*c as *const Cell<u64> as usize) as u64;
+            let addr = (c as *const Cell<u64> as usize) as u64;
             state = now ^ salt ^ addr;
         }
         state = state.wrapping_add(0x9e3779b97f4a7c15);
@@ -441,8 +441,10 @@ impl AppCore {
     ) -> anyhow::Result<ScoreResponse> {
         let t0 = Instant::now();
 
-        let mut timings = TimingsUs::default();
-        timings.parse = parse_us;
+        let mut timings = TimingsUs {
+            parse: parse_us,
+            ..TimingsUs::default()
+        };
 
         let quick = self
             .quick
@@ -671,8 +673,10 @@ impl AppCore {
     ) -> anyhow::Result<ScoreResponse> {
         let t0 = Instant::now();
 
-        let mut timings = TimingsUs::default();
-        timings.parse = parse_us;
+        let mut timings = TimingsUs {
+            parse: parse_us,
+            ..TimingsUs::default()
+        };
 
         let quick = self
             .quick

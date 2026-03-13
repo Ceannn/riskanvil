@@ -388,6 +388,10 @@ struct ApproxPolicy {
     #[serde(default)]
     used_tau_reject: Vec<Option<f32>>,
     #[serde(default)]
+    used_tau_ref_dense: Vec<f32>,
+    #[serde(default)]
+    used_tau_positive_dense: Vec<f32>,
+    #[serde(default)]
     k_hot: usize,
     #[serde(default = "default_rank_mode")]
     rank_mode: RankMode,
@@ -3535,6 +3539,20 @@ fn load_approx_policy(path: &PathBuf) -> Result<ApproxPolicy> {
     if policy.k_hot == 0 {
         policy.k_hot = policy.used_checkpoints.iter().copied().max().unwrap_or(0);
     }
+    if policy.used_tau_ref_dense.len() != policy.used_tau_ref.len() {
+        policy.used_tau_ref_dense = policy
+            .used_tau_ref
+            .iter()
+            .map(|v| v.unwrap_or(f32::NAN))
+            .collect();
+    }
+    if policy.used_tau_positive_dense.len() != used_pos {
+        policy.used_tau_positive_dense = policy
+            .used_tau_positive()
+            .iter()
+            .map(|v| v.unwrap_or(f32::NAN))
+            .collect();
+    }
     if policy.checkpoint_exit_counts.len() != policy.used_checkpoints.len() {
         policy.checkpoint_exit_counts = vec![0u64; policy.used_checkpoints.len()];
     }
@@ -3543,12 +3561,22 @@ fn load_approx_policy(path: &PathBuf) -> Result<ApproxPolicy> {
 
 impl ApproxPolicy {
     #[inline(always)]
-    fn used_tau_positive(&self) -> &[Option<f32>] {
+    pub(crate) fn used_tau_positive(&self) -> &[Option<f32>] {
         if !self.used_tau_reject.is_empty() {
             &self.used_tau_reject
         } else {
             &self.used_tau_pass
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn used_tau_ref_dense(&self) -> &[f32] {
+        &self.used_tau_ref_dense
+    }
+
+    #[inline(always)]
+    pub(crate) fn used_tau_positive_dense(&self) -> &[f32] {
+        &self.used_tau_positive_dense
     }
 }
 

@@ -636,6 +636,145 @@ fn maybe_exact_exit(
     }
 }
 
+const HOT_L1_COMPACT_NODE_LEAF: u16 = 1 << 15;
+const HOT_L1_COMPACT_NODE_FIDX_MASK: u16 = HOT_L1_COMPACT_NODE_LEAF - 1;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub(crate) struct HotApproxL1CompactNode {
+    thr: f32,
+    leaf: f32,
+    left: u16,
+    right: u16,
+    fidx_flags: u16,
+    _pad: u16,
+}
+
+impl HotApproxL1CompactNode {
+    #[inline(always)]
+    fn is_leaf(self) -> bool {
+        (self.fidx_flags & HOT_L1_COMPACT_NODE_LEAF) != 0
+    }
+
+    #[inline(always)]
+    fn fidx(self) -> usize {
+        (self.fidx_flags & HOT_L1_COMPACT_NODE_FIDX_MASK) as usize
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct HotApproxL1CompactPack {
+    n_trees: usize,
+    tree_node_offs: Vec<u32>,
+    nodes: Vec<HotApproxL1CompactNode>,
+}
+
+pub(crate) fn compile_hot_approx_l1_compact_pack(
+    model: &SoaModel,
+    plan: &TreeOrder,
+    approx_policy: &ApproxPolicy,
+) -> Result<Option<HotApproxL1CompactPack>> {
+    let k_hot = approx_policy.k_hot.min(plan.n_trees);
+    if k_hot == 0 || model.n_features > HOT_L1_COMPACT_NODE_FIDX_MASK as usize {
+        return Ok(None);
+    }
+
+    let mut tree_node_offs = Vec::with_capacity(k_hot);
+    let mut nodes = Vec::new();
+    let mut local_idx_buf = vec![u16::MAX; model.is_leaf.len()];
+    let mut stack = Vec::new();
+
+    for pos in 0..k_hot {
+        let tree_idx = plan.order[pos] as usize;
+        let root = model.tree_roots[tree_idx] as usize;
+        tree_node_offs.push(nodes.len() as u32);
+        stack.clear();
+        stack.push(root);
+
+        while let Some(idx) = stack.pop() {
+            if local_idx_buf[idx] != u16::MAX {
+                continue;
+            }
+            let local_idx = (nodes.len() - tree_node_offs[pos] as usize) as u16;
+            local_idx_buf[idx] = local_idx;
+            if model.is_leaf[idx] != 0 {
+                nodes.push(HotApproxL1CompactNode {
+                    thr: 0.0,
+                    leaf: model.leaf[idx],
+                    left: 0,
+                    right: 0,
+                    fidx_flags: HOT_L1_COMPACT_NODE_LEAF,
+                    _pad: 0,
+                });
+                continue;
+            }
+            nodes.push(HotApproxL1CompactNode {
+                thr: model.thr[idx],
+                leaf: 0.0,
+                left: 0,
+                right: 0,
+                fidx_flags: model.fidx[idx] as u16,
+                _pad: 0,
+            });
+            stack.push(model.right[idx] as usize);
+            stack.push(model.left[idx] as usize);
+        }
+
+        stack.clear();
+        stack.push(root);
+        while let Some(idx) = stack.pop() {
+            let local_idx = local_idx_buf[idx] as usize + tree_node_offs[pos] as usize;
+            if model.is_leaf[idx] != 0 {
+                continue;
+            }
+            let left_idx = model.left[idx] as usize;
+            let right_idx = model.right[idx] as usize;
+            nodes[local_idx].left = local_idx_buf[left_idx];
+            nodes[local_idx].right = local_idx_buf[right_idx];
+            stack.push(right_idx);
+            stack.push(left_idx);
+        }
+
+        stack.clear();
+        stack.push(root);
+        while let Some(idx) = stack.pop() {
+            let local = std::mem::replace(&mut local_idx_buf[idx], u16::MAX);
+            if local == u16::MAX || model.is_leaf[idx] != 0 {
+                continue;
+            }
+            stack.push(model.right[idx] as usize);
+            stack.push(model.left[idx] as usize);
+        }
+    }
+
+    Ok(Some(HotApproxL1CompactPack {
+        n_trees: k_hot,
+        tree_node_offs,
+        nodes,
+    }))
+}
+
+#[inline(always)]
+fn maybe_exact_exit_margin(
+    margin: f32,
+    suffix_min: f32,
+    suffix_max: f32,
+    eps: f32,
+    bound_guard: f32,
+) -> Option<bool> {
+    let lower = (margin as f64) + (suffix_min as f64);
+    let upper = (margin as f64) + (suffix_max as f64);
+    let pass_cut = (eps + bound_guard) as f64;
+    let ref_cut = -(eps + bound_guard) as f64;
+    if lower >= pass_cut {
+        Some(true)
+    } else if upper < ref_cut {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[inline(always)]
 fn maybe_approx_exit(
     score: f32,
@@ -688,40 +827,98 @@ unsafe fn traverse_approx_float_nomiss_l1_hot(
     bound_guard: f32,
     bound_check_every: usize,
 ) -> Result<(f32, bool, i32, RowMeta)> {
-    let mut score = base_score;
+    traverse_approx_float_nomiss_l1_hot_impl(
+        None,
+        model,
+        feat,
+        threshold,
+        base_score,
+        plan,
+        approx_policy,
+        eps,
+        bound_guard,
+        bound_check_every,
+    )
+}
+
+#[inline(always)]
+pub(crate) unsafe fn traverse_approx_float_nomiss_l1_hot_compact(
+    hot_pack: &HotApproxL1CompactPack,
+    model: &SoaModel,
+    feat: &[f32],
+    threshold: f32,
+    base_score: f32,
+    plan: &TreeOrder,
+    approx_policy: &ApproxPolicy,
+    eps: f32,
+    bound_guard: f32,
+    bound_check_every: usize,
+) -> Result<(f32, bool, i32, RowMeta)> {
+    traverse_approx_float_nomiss_l1_hot_impl(
+        Some(hot_pack),
+        model,
+        feat,
+        threshold,
+        base_score,
+        plan,
+        approx_policy,
+        eps,
+        bound_guard,
+        bound_check_every,
+    )
+}
+
+#[inline(always)]
+unsafe fn traverse_approx_float_nomiss_l1_hot_impl(
+    hot_pack: Option<&HotApproxL1CompactPack>,
+    model: &SoaModel,
+    feat: &[f32],
+    threshold: f32,
+    base_score: f32,
+    plan: &TreeOrder,
+    approx_policy: &ApproxPolicy,
+    eps: f32,
+    bound_guard: f32,
+    bound_check_every: usize,
+) -> Result<(f32, bool, i32, RowMeta)> {
+    let mut margin = base_score - threshold;
     let mut visited = 0i32;
-    let mut cp_idx = 0usize;
     let checkpoints = approx_policy.used_checkpoints.as_slice();
-    let tau_ref = approx_policy.used_tau_ref.as_slice();
-    let tau_pos = approx_policy.used_tau_positive();
+    let tau_ref = approx_policy.used_tau_ref_dense();
+    let tau_pos = approx_policy.used_tau_positive_dense();
+    let mut cp_idx = 0usize;
     let mut next_cp = checkpoints.get(0).copied().unwrap_or(usize::MAX);
     let k_hot = approx_policy.k_hot.min(plan.n_trees);
 
-    for pos in 0..k_hot {
-        let tree_idx = *plan.order.get_unchecked(pos) as usize;
-        let mut idx = *model.tree_roots.get_unchecked(tree_idx) as usize;
-        loop {
-            if *model.is_leaf.get_unchecked(idx) != 0 {
-                score += *model.leaf.get_unchecked(idx);
-                break;
+    if let Some(hot_pack) = hot_pack {
+        let hot_tree_offs = hot_pack.tree_node_offs.as_slice();
+        let hot_nodes = hot_pack.nodes.as_slice();
+        let hot_trees = hot_pack.n_trees.min(k_hot);
+        for pos in 0..hot_trees {
+            let base = *hot_tree_offs.get_unchecked(pos) as usize;
+            let mut local_idx = 0usize;
+            loop {
+                let node = *hot_nodes.get_unchecked(base + local_idx);
+                if node.is_leaf() {
+                    margin += node.leaf;
+                    break;
+                }
+                let x = *feat.get_unchecked(node.fidx());
+                local_idx = if x < node.thr {
+                    node.left as usize
+                } else {
+                    node.right as usize
+                };
             }
-            let fidx = *model.fidx.get_unchecked(idx) as usize;
-            let x = *feat.get_unchecked(fidx);
-            idx = if x < *model.thr.get_unchecked(idx) {
-                *model.left.get_unchecked(idx) as usize
-            } else {
-                *model.right.get_unchecked(idx) as usize
-            };
-        }
-        let m_end = pos + 1;
-        visited = m_end as i32;
-        if m_end == next_cp {
-            let checkpoint_slot = cp_idx;
-            cp_idx += 1;
-            if let Some(tau) = *tau_ref.get_unchecked(checkpoint_slot) {
-                if (score - threshold) <= tau {
+            let m_end = pos + 1;
+            visited = m_end as i32;
+            if m_end == next_cp {
+                let checkpoint_slot = cp_idx;
+                cp_idx += 1;
+                let tau = *tau_ref.get_unchecked(checkpoint_slot);
+                if !tau.is_nan() && margin <= tau {
                     return Ok((
-                        score,
+                        margin + threshold,
                         false,
                         visited,
                         RowMeta {
@@ -731,11 +928,10 @@ unsafe fn traverse_approx_float_nomiss_l1_hot(
                         },
                     ));
                 }
-            }
-            if let Some(tau) = *tau_pos.get_unchecked(checkpoint_slot) {
-                if (score - threshold) >= tau {
+                let tau = *tau_pos.get_unchecked(checkpoint_slot);
+                if !tau.is_nan() && margin >= tau {
                     return Ok((
-                        score,
+                        margin + threshold,
                         true,
                         visited,
                         RowMeta {
@@ -745,18 +941,16 @@ unsafe fn traverse_approx_float_nomiss_l1_hot(
                         },
                     ));
                 }
+                next_cp = checkpoints.get(cp_idx).copied().unwrap_or(usize::MAX);
             }
-            next_cp = checkpoints.get(cp_idx).copied().unwrap_or(usize::MAX);
         }
-    }
-
-    if bound_check_every == 1 {
-        for pos in k_hot..plan.n_trees {
+    } else {
+        for pos in 0..k_hot {
             let tree_idx = *plan.order.get_unchecked(pos) as usize;
             let mut idx = *model.tree_roots.get_unchecked(tree_idx) as usize;
             loop {
                 if *model.is_leaf.get_unchecked(idx) != 0 {
-                    score += *model.leaf.get_unchecked(idx);
+                    margin += *model.leaf.get_unchecked(idx);
                     break;
                 }
                 let fidx = *model.fidx.get_unchecked(idx) as usize;
@@ -769,24 +963,77 @@ unsafe fn traverse_approx_float_nomiss_l1_hot(
             }
             let m_end = pos + 1;
             visited = m_end as i32;
-            if let Some(pass) = maybe_exact_exit(
-                score,
-                threshold,
+            if m_end == next_cp {
+                let checkpoint_slot = cp_idx;
+                cp_idx += 1;
+                let tau = *tau_ref.get_unchecked(checkpoint_slot);
+                if !tau.is_nan() && margin <= tau {
+                    return Ok((
+                        margin + threshold,
+                        false,
+                        visited,
+                        RowMeta {
+                            approx_pass: false,
+                            approx_refer: true,
+                            approx_checkpoint_idx: checkpoint_slot as i32,
+                        },
+                    ));
+                }
+                let tau = *tau_pos.get_unchecked(checkpoint_slot);
+                if !tau.is_nan() && margin >= tau {
+                    return Ok((
+                        margin + threshold,
+                        true,
+                        visited,
+                        RowMeta {
+                            approx_pass: true,
+                            approx_refer: false,
+                            approx_checkpoint_idx: checkpoint_slot as i32,
+                        },
+                    ));
+                }
+                next_cp = checkpoints.get(cp_idx).copied().unwrap_or(usize::MAX);
+            }
+        }
+    }
+
+    let hot_done = hot_pack.map(|p| p.n_trees.min(k_hot)).unwrap_or(k_hot);
+    if bound_check_every == 1 {
+        for pos in hot_done..plan.n_trees {
+            let tree_idx = *plan.order.get_unchecked(pos) as usize;
+            let mut idx = *model.tree_roots.get_unchecked(tree_idx) as usize;
+            loop {
+                if *model.is_leaf.get_unchecked(idx) != 0 {
+                    margin += *model.leaf.get_unchecked(idx);
+                    break;
+                }
+                let fidx = *model.fidx.get_unchecked(idx) as usize;
+                let x = *feat.get_unchecked(fidx);
+                idx = if x < *model.thr.get_unchecked(idx) {
+                    *model.left.get_unchecked(idx) as usize
+                } else {
+                    *model.right.get_unchecked(idx) as usize
+                };
+            }
+            let m_end = pos + 1;
+            visited = m_end as i32;
+            if let Some(pass) = maybe_exact_exit_margin(
+                margin,
                 *plan.suffix_min.get_unchecked(m_end),
                 *plan.suffix_max.get_unchecked(m_end),
                 eps,
                 bound_guard,
             ) {
-                return Ok((score, pass, visited, RowMeta::default()));
+                return Ok((margin + threshold, pass, visited, RowMeta::default()));
             }
         }
     } else {
-        for pos in k_hot..plan.n_trees {
+        for pos in hot_done..plan.n_trees {
             let tree_idx = *plan.order.get_unchecked(pos) as usize;
             let mut idx = *model.tree_roots.get_unchecked(tree_idx) as usize;
             loop {
                 if *model.is_leaf.get_unchecked(idx) != 0 {
-                    score += *model.leaf.get_unchecked(idx);
+                    margin += *model.leaf.get_unchecked(idx);
                     break;
                 }
                 let fidx = *model.fidx.get_unchecked(idx) as usize;
@@ -800,21 +1047,20 @@ unsafe fn traverse_approx_float_nomiss_l1_hot(
             let m_end = pos + 1;
             visited = m_end as i32;
             if ((m_end % bound_check_every) == 0) || (m_end == plan.n_trees) {
-                if let Some(pass) = maybe_exact_exit(
-                    score,
-                    threshold,
+                if let Some(pass) = maybe_exact_exit_margin(
+                    margin,
                     *plan.suffix_min.get_unchecked(m_end),
                     *plan.suffix_max.get_unchecked(m_end),
                     eps,
                     bound_guard,
                 ) {
-                    return Ok((score, pass, visited, RowMeta::default()));
+                    return Ok((margin + threshold, pass, visited, RowMeta::default()));
                 }
             }
         }
     }
 
-    Ok((score, score >= threshold, visited, RowMeta::default()))
+    Ok((margin + threshold, margin >= 0.0, visited, RowMeta::default()))
 }
 
 #[inline(always)]
@@ -1537,11 +1783,7 @@ fn run_kernel(
                 .enumerate()
                 .map(|(chunk_idx, ((score_chunk, pass_chunk), visit_chunk))| -> Result<(usize, usize, Vec<u64>)> {
                     let start = chunk_idx * chunk_rows;
-                    let mut rank_cache = if let Some(pack) = rank_pack {
-                        Some(RankCache::new(pack.n_features))
-                    } else {
-                        None
-                    };
+                    let mut rank_cache = rank_pack.map(|pack| RankCache::new(pack.n_features));
                     let mut hot_buf = hot_prefix_pack.map(|p| HotFeatureBuf::new(p.n_hot_features));
                     let mut approx_pass_cnt = 0usize;
                     let mut approx_ref_cnt = 0usize;
@@ -1730,11 +1972,7 @@ fn run_kernel(
                 )?;
             Ok(counts)
         } else {
-            let mut rank_cache = if let Some(pack) = rank_pack {
-                Some(RankCache::new(pack.n_features))
-            } else {
-                None
-            };
+            let mut rank_cache = rank_pack.map(|pack| RankCache::new(pack.n_features));
             let mut hot_buf = hot_prefix_pack.map(|p| HotFeatureBuf::new(p.n_hot_features));
             let mut approx_pass_cnt = 0usize;
             let mut approx_ref_cnt = 0usize;

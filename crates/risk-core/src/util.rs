@@ -19,7 +19,7 @@ pub fn sigmoid(x: f64) -> f64 {
 
 #[inline]
 pub fn clamp01(x: f64) -> f64 {
-    if x < 0.0 { 0.0 } else if x > 1.0 { 1.0 } else { x }
+    x.clamp(0.0, 1.0)
 }
 
 #[inline]

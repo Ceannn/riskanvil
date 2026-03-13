@@ -1,6 +1,7 @@
-use tracing::{info, trace};
 use std::cell::RefCell;
+use std::path::Path;
 use std::sync::OnceLock;
+use tracing::{info, trace};
 use crate::exp_l2_7945hx::ExperimentalL2Kernel7945hx;
 use crate::l2_exp_v1::{ExpHotStageBuf, L2ExpV1Runtime};
 
@@ -132,6 +133,7 @@ struct OnlineL1Runtime {
     model: SoaModel,
     plan: TreeOrder,
     approx_policy: ApproxPolicy,
+    hot_compact_pack: Option<HotApproxL1CompactPack>,
     threshold: f32,
     base_score: f32,
 }
@@ -181,6 +183,8 @@ impl MinpackRuntime {
             &bundle_dir,
             "runs/L1_RUST_V5/approx_policy_v3/approx_policy.json",
         )?)?;
+        let l1_hot_compact_pack =
+            compile_hot_approx_l1_compact_pack(&l1_soa, &l1_plan, &l1_approx_policy)?;
         let l1_threshold = load_threshold(&l1_model_dir.join("policy.json"), None)?;
         let l1_base_score = parse_base_score_from_any_json(&require_path(
             &bundle_dir,
@@ -232,6 +236,7 @@ impl MinpackRuntime {
                 model: l1_soa,
                 plan: l1_plan,
                 approx_policy: l1_approx_policy,
+                hot_compact_pack: l1_hot_compact_pack,
                 threshold: l1_threshold,
                 base_score: l1_base_score,
             },
@@ -298,17 +303,32 @@ impl MinpackRuntime {
         let nan_free = !feat.iter().any(|x| x.is_nan());
         let (score, passed, visited, _) = if nan_free {
             unsafe {
-                traverse_approx_float_nomiss_l1_hot(
-                    &self.l1.model,
-                    feat,
-                    self.l1.threshold,
-                    self.l1.base_score,
-                    &self.l1.plan,
-                    &self.l1.approx_policy,
-                    0.0,
-                    0.0,
-                    1,
-                )?
+                if let Some(hot_pack) = self.l1.hot_compact_pack.as_ref() {
+                    traverse_approx_float_nomiss_l1_hot_compact(
+                        hot_pack,
+                        &self.l1.model,
+                        feat,
+                        self.l1.threshold,
+                        self.l1.base_score,
+                        &self.l1.plan,
+                        &self.l1.approx_policy,
+                        0.0,
+                        0.0,
+                        1,
+                    )?
+                } else {
+                    traverse_approx_float_nomiss_l1_hot(
+                        &self.l1.model,
+                        feat,
+                        self.l1.threshold,
+                        self.l1.base_score,
+                        &self.l1.plan,
+                        &self.l1.approx_policy,
+                        0.0,
+                        0.0,
+                        1,
+                    )?
+                }
             }
         } else {
             traverse_approx_generic(
@@ -337,17 +357,32 @@ impl MinpackRuntime {
             bail!("l1 feat len mismatch: got={} expected={}", feat.len(), self.l1_dim);
         }
         let (score, passed, visited, _) = unsafe {
-            traverse_approx_float_nomiss_l1_hot(
-                &self.l1.model,
-                feat,
-                self.l1.threshold,
-                self.l1.base_score,
-                &self.l1.plan,
-                &self.l1.approx_policy,
-                0.0,
-                0.0,
-                1,
-            )?
+            if let Some(hot_pack) = self.l1.hot_compact_pack.as_ref() {
+                traverse_approx_float_nomiss_l1_hot_compact(
+                    hot_pack,
+                    &self.l1.model,
+                    feat,
+                    self.l1.threshold,
+                    self.l1.base_score,
+                    &self.l1.plan,
+                    &self.l1.approx_policy,
+                    0.0,
+                    0.0,
+                    1,
+                )?
+            } else {
+                traverse_approx_float_nomiss_l1_hot(
+                    &self.l1.model,
+                    feat,
+                    self.l1.threshold,
+                    self.l1.base_score,
+                    &self.l1.plan,
+                    &self.l1.approx_policy,
+                    0.0,
+                    0.0,
+                    1,
+                )?
+            }
         };
         Ok(OnlineL1Output {
             score,
@@ -820,7 +855,7 @@ fn absolutize_resolved_bundle(root: &PathBuf, mut resolved: ResolvedPrefixCalBun
     resolved
 }
 
-fn bundle_abspath(root: &PathBuf, path: PathBuf) -> PathBuf {
+fn bundle_abspath(root: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
@@ -828,7 +863,7 @@ fn bundle_abspath(root: &PathBuf, path: PathBuf) -> PathBuf {
     }
 }
 
-fn require_path(root: &PathBuf, rel: &str) -> Result<PathBuf> {
+fn require_path(root: &Path, rel: &str) -> Result<PathBuf> {
     let path = root.join(rel);
     if path.exists() {
         Ok(path)

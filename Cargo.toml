@@ -5,27 +5,16 @@ members = [
   "crates/risk-quickscorer",
   "crates/risk-quickscorer-standalone-l2",
   "crates/risk-server-tokio",
-  "crates/tokio-server-batchplane",
-  "crates/risk-bench",
-  "crates/risk-bench2",
   "crates/risk-bench3",
-  "crates/risk-bench-h2",
-  "crates/risk-server-glommio",
-  "crates/risk-mamba-kernel",
-  "crates/risk_mamba_runner",
-  "crates/risk-mamba-v1"
+  "crates/risk-server-glommio"
 ]
 default-members = [
   "crates/risk-core",
   "crates/risk-quickscorer",
   "crates/risk-quickscorer-standalone-l2",
   "crates/risk-server-tokio",
-  "crates/risk-bench",
-  "crates/risk-bench2",
   "crates/risk-bench3",
-  "crates/risk-server-glommio",
-  "crates/risk-mamba-kernel",
-  "crates/risk_mamba_runner"
+  "crates/risk-server-glommio"
 ]
 
 [profile.release]

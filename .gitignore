@@ -46,3 +46,14 @@ crates/risk-core/native/
 /crates/results/
 /crates/risk-bench-lag-delay.patch
 /crates/risk-core/native/
+/crates/risk-server-glommio/src/mamba_runtime.rs
+/DEV_GUIDE/
+/tools/
+/crates/risk-bench/
+/crates/risk-bench2/
+/crates/risk-bench-h2/
+/crates/risk-mamba-kernel/
+/crates/risk-mamba-v1/
+/crates/risk_mamba_runner/
+/crates/tokio-server-batchplane/
+/crates/xgb-ffi/

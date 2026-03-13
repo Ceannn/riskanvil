@@ -1,4 +1,3 @@
-// crates/risk-server-tokio/src/pin.rs
 #![allow(dead_code)]
 
 use anyhow::Context;
@@ -31,7 +30,7 @@ pub fn pin_tokio_runtime_workers(io_cpus: &[usize]) -> anyhow::Result<()> {
         let name = std::fs::read_to_string(&comm_path).unwrap_or_default();
         let name = name.trim();
 
-        // 只 pin tokio runtime worker，避免影响 xgb-worker/main/其他线程的 affinity 继承
+        // Pin Tokio runtime workers only.
         if !name.starts_with("tokio-runtime-w") && !name.contains("tokio-runtime") {
             continue;
         }

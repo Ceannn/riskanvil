@@ -1,39 +1,5 @@
-// crates/risk-core/src/schema.rs
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Channel {
-    Pos,
-    Ecom,
-    Atm,
-    Transfer,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScoreRequest {
-    /// 可选：客户端传入；否则服务端生成
-    pub trace_id: Option<Uuid>,
-
-    /// 事件时间（ms since epoch），用于点时一致/回放（不使用 arrival time）
-    pub event_time_ms: i64,
-
-    pub user_id: String,
-    pub card_id: String,
-    pub merchant_id: String,
-    pub mcc: i32,
-
-    pub amount: f64,
-    pub currency: String,
-    pub country: String,
-
-    pub channel: Channel,
-    pub device_id: String,
-    pub ip_prefix: String,
-
-    pub is_3ds: bool,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,7 +7,7 @@ pub enum Decision {
     Allow,
     ManualReview,
     Deny,
-    /// 超时/预算不足时的“保守降级”：为了不误杀，直接放行
+    /// Conservative fallback when time or budget runs out.
     DegradeAllow,
 }
 
@@ -59,7 +25,7 @@ pub struct ScoreResponse {
     pub score: f64,
     pub decision: Decision,
     pub reason: Vec<ReasonItem>,
-    /// 分段耗时（微秒）
+    /// Per-stage timings in microseconds.
     pub timings_us: TimingsUs,
 }
 
@@ -68,7 +34,8 @@ pub struct TimingsUs {
     pub parse: u64,
     pub feature: u64,
     pub router: u64,
-    pub xgb: u64,
+    #[serde(default, alias = "xgb")]
+    pub l1: u64,
     pub l2: u64,
     pub serialize: u64,
 }

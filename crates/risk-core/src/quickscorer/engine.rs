@@ -526,9 +526,7 @@ mod tests {
                 return Some(path);
             }
         }
-        let default =
-            PathBuf::from("/home/ceann/projects/rust/quickscorer_7945hx_minpack_20260308");
-        default.exists().then_some(default)
+        None
     }
 
     fn encode_constant_row(dim: usize, value: f32) -> Vec<u8> {

@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 mod exp_l2_7945hx;
-mod l2_kernel_7945hx;
 mod l2_exp_v1;
+mod l2_kernel_7945hx;
 mod qs_exact;
 
 const MAGIC_SOA: &[u8] = b"L1SOAv1\0";

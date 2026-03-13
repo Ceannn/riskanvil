@@ -79,9 +79,10 @@ pub struct QsPrefixDecisionRow {
 }
 
 pub fn load_qs_pack(path: &PathBuf) -> Result<QsPack> {
-    let file = File::open(path).with_context(|| format!("open qs pack failed: {}", path.display()))?;
-    let mmap =
-        unsafe { Mmap::map(&file) }.with_context(|| format!("mmap qs pack failed: {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("open qs pack failed: {}", path.display()))?;
+    let mmap = unsafe { Mmap::map(&file) }
+        .with_context(|| format!("mmap qs pack failed: {}", path.display()))?;
     let buf = &mmap[..];
     if buf.len() < MAGIC_QS.len() + 16 + 56 {
         bail!("qs pack too short");
@@ -483,7 +484,12 @@ pub fn score_tree_indices_from_quantized(
 }
 
 #[inline(always)]
-fn score_row(pack: &QsPack, feat: &[f32], ranks: &mut [u8], missing: &mut [u8]) -> Result<(f32, u64, u64)> {
+fn score_row(
+    pack: &QsPack,
+    feat: &[f32],
+    ranks: &mut [u8],
+    missing: &mut [u8],
+) -> Result<(f32, u64, u64)> {
     quantize_row(pack, feat, ranks, missing);
     let mut score = pack.base_score;
     let mut block_evals = 0u64;
@@ -512,7 +518,11 @@ fn score_row(pack: &QsPack, feat: &[f32], ranks: &mut [u8], missing: &mut [u8]) 
         }
         let leaf_idx = decode_leaf(lo, hi)?;
         if leaf_idx >= tree.leaf_cnt as usize {
-            bail!("decoded leaf {} outside tree leaf count {}", leaf_idx, tree.leaf_cnt);
+            bail!(
+                "decoded leaf {} outside tree leaf count {}",
+                leaf_idx,
+                tree.leaf_cnt
+            );
         }
         score += pack.leaf_values[tree.leaf_val_off as usize + leaf_idx];
     }
@@ -520,12 +530,7 @@ fn score_row(pack: &QsPack, feat: &[f32], ranks: &mut [u8], missing: &mut [u8]) 
 }
 
 #[inline(always)]
-fn mask_bounds(
-    pack: &QsPack,
-    tree: &QsTreeHdr,
-    lo: u64,
-    hi: u64,
-) -> Result<(f32, f32)> {
+fn mask_bounds(pack: &QsPack, tree: &QsTreeHdr, lo: u64, hi: u64) -> Result<(f32, f32)> {
     let leaf_values = &pack.leaf_values
         [tree.leaf_val_off as usize..tree.leaf_val_off as usize + tree.leaf_cnt as usize];
     let mut min_val = f32::INFINITY;
@@ -545,7 +550,11 @@ fn mask_bounds(
     while hi_bits != 0 {
         let idx = 64 + hi_bits.trailing_zeros() as usize;
         if idx >= tree.leaf_cnt as usize {
-            bail!("decoded leaf {} outside tree leaf count {}", idx, tree.leaf_cnt);
+            bail!(
+                "decoded leaf {} outside tree leaf count {}",
+                idx,
+                tree.leaf_cnt
+            );
         }
         min_val = min_val.min(leaf_values[idx]);
         max_val = max_val.max(leaf_values[idx]);
@@ -676,7 +685,11 @@ pub fn prefix_checkpoints_row_from(
         }
         let leaf_idx = decode_leaf(lo, hi)?;
         if leaf_idx >= tree.leaf_cnt as usize {
-            bail!("decoded leaf {} outside tree leaf count {}", leaf_idx, tree.leaf_cnt);
+            bail!(
+                "decoded leaf {} outside tree leaf count {}",
+                leaf_idx,
+                tree.leaf_cnt
+            );
         }
         score += pack.leaf_values[tree.leaf_val_off as usize + leaf_idx];
 
@@ -801,7 +814,11 @@ where
         }
         let leaf_idx = decode_leaf(lo, hi)?;
         if leaf_idx >= tree.leaf_cnt as usize {
-            bail!("decoded leaf {} outside tree leaf count {}", leaf_idx, tree.leaf_cnt);
+            bail!(
+                "decoded leaf {} outside tree leaf count {}",
+                leaf_idx,
+                tree.leaf_cnt
+            );
         }
         score += pack.leaf_values[tree.leaf_val_off as usize + leaf_idx];
 
@@ -876,7 +893,7 @@ pub fn run_qs_exact(
     let par_threads = active_threads(threads);
     let parallel_enabled = par_threads > 1 && n >= parallel_min_rows;
 
-    let mut work = || -> Result<QsAgg> {
+    let work = || -> Result<QsAgg> {
         if parallel_enabled {
             scores
                 .par_chunks_mut(chunk_rows.max(1))
@@ -889,7 +906,8 @@ pub fn run_qs_exact(
                     for local_idx in 0..score_chunk.len() {
                         let row_idx = start + local_idx;
                         let feat = batch.row(row_idx);
-                        let (score, blocks, resolved) = score_row(pack, feat, &mut ranks, &mut missing)?;
+                        let (score, blocks, resolved) =
+                            score_row(pack, feat, &mut ranks, &mut missing)?;
                         score_chunk[local_idx] = score;
                         agg.total_block_evals += blocks;
                         agg.resolved_early_trees += resolved;

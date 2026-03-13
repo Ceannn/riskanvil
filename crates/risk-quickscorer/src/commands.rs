@@ -1311,9 +1311,8 @@ fn run_qs_l2_prefix_cal(args: QsL2PrefixCalArgs) -> Result<()> {
                     .enumerate()
                     .map(
                         |(chunk_idx, chunk)| -> Result<(usize, usize, usize, usize, usize, usize, u64, u64, u64, u64, Vec<u64>)> {
-                            let (
-                                ((((((((((((((prefix_chunk, trees_chunk), shadow_chunk), final_chunk), fallback_chunk), direct_cp_chunk), anchor_cp_chunk), rescue_cp_chunk), rescue_route_chunk), fallback_cp_chunk), router_choice_chunk), router_tau_chunk), score_chunk), block_chunk), visit_chunk)
-                            ) = chunk;
+                            let ((((((((((((((prefix_chunk, trees_chunk), shadow_chunk), final_chunk), fallback_chunk), direct_cp_chunk), anchor_cp_chunk), rescue_cp_chunk), rescue_route_chunk), fallback_cp_chunk), router_choice_chunk), router_tau_chunk), score_chunk), block_chunk), visit_chunk) =
+                                chunk;
                             let start = chunk_idx * args.chunk_rows.max(1);
                             let mut ranks = vec![0u8; base_n_features];
                             let mut missing = vec![0u8; base_n_features];
@@ -1912,7 +1911,7 @@ fn run_qs_l2_prefix_cal(args: QsL2PrefixCalArgs) -> Result<()> {
         feature_format: batch.format_tag.clone(),
         nan_free: batch.nan_free,
         shadow_only: args.shadow_only,
-        v4_mode: v4_mode,
+        v4_mode,
         direct_kernel: prefix_direct_kernel_str(first_runtime.direct_kernel).to_string(),
         certifier_kind: prefix_certifier_kind_str(first_runtime.certifier_kind).to_string(),
         hot_exact_prefix_limit: first_runtime.hot_exact_prefix_limit,

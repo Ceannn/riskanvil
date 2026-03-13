@@ -6,10 +6,8 @@ edition = "2021"
 [dependencies]
 risk-core = { path = "../risk-core", default-features = false }
 risk-quickscorer-standalone-l2 = { path = "../risk-quickscorer-standalone-l2" }
-risk-mamba-kernel = { path = "../risk-mamba-kernel" }
 
 bytes = "1"
-sha2 = "0.10"
 
 glommio = "0.9"
 futures-lite = "2"
